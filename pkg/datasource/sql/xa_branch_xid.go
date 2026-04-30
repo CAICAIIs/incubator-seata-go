@@ -18,6 +18,7 @@
 package sql
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -76,6 +77,20 @@ func (x *XABranchXid) GetBranchQualifier() []byte {
 
 func (x *XABranchXid) String() string {
 	return x.xid + branchIdPrefix + strconv.FormatUint(x.branchId, 10)
+}
+
+func ParseXABranchXid(xaBranchXid string) (*XABranchXid, error) {
+	lastIdx := strings.LastIndex(xaBranchXid, branchIdPrefix)
+	if lastIdx <= 0 || lastIdx == len(xaBranchXid)-len(branchIdPrefix) {
+		return nil, fmt.Errorf("invalid xa branch xid: %s", xaBranchXid)
+	}
+
+	branchID, err := strconv.ParseUint(xaBranchXid[lastIdx+len(branchIdPrefix):], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid xa branch xid: %s", xaBranchXid)
+	}
+
+	return XaIdBuild(xaBranchXid[:lastIdx], branchID), nil
 }
 
 func WithXid(xid string) Option {

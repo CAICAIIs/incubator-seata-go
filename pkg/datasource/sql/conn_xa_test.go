@@ -21,6 +21,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -32,12 +33,13 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/exec"
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/mock"
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/types"
-	"seata.apache.org/seata-go/v2/pkg/datasource/sql/xa"
 	"seata.apache.org/seata-go/v2/pkg/protocol/branch"
+	"seata.apache.org/seata-go/v2/pkg/rm"
 	"seata.apache.org/seata-go/v2/pkg/tm"
 )
 
@@ -108,6 +110,7 @@ var simulateExecContextError func(query string) error
 
 func baseMockConn(mockConn *mock.MockTestDriverConn) {
 	branchStatusCache = gcache.New(1024).LRU().Expiration(time.Minute * 10).Build()
+	xaConnTimeout = time.Hour
 
 	mockConn.EXPECT().ExecContext(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
 		func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -133,12 +136,7 @@ func baseMockConn(mockConn *mock.MockTestDriverConn) {
 		})
 }
 
-func initXAConnTestResource(t *testing.T) (*gomock.Controller, *sql.DB, *mockSQLInterceptor, *mockTxHook) {
-	ctrl := gomock.NewController(t)
-
-	mockMgr := initMockResourceManager(branch.BranchTypeXA, ctrl)
-	_ = mockMgr
-	//db, err := sql.Open("seata-xa-mysql", "root:seata_go@tcp(127.0.0.1:3306)/seata_go_test?multiStatements=true")
+func initXAConnTestDB(t *testing.T, ctrl *gomock.Controller) *sql.DB {
 	db, err := sql.Open("seata-xa-mysql", "root:12345678@tcp(127.0.0.1:3306)/seata_client?multiStatements=true&interpolateParams=true")
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +157,16 @@ func initXAConnTestResource(t *testing.T) (*gomock.Controller, *sql.DB, *mockSQL
 		return connector
 	})
 
+	return db
+}
+
+func initXAConnTestResource(t *testing.T) (*gomock.Controller, *sql.DB, *mockSQLInterceptor, *mockTxHook) {
+	ctrl := gomock.NewController(t)
+
+	mockMgr := initMockResourceManager(branch.BranchTypeXA, ctrl)
+	_ = mockMgr
+	db := initXAConnTestDB(t, ctrl)
+
 	mi := &mockSQLInterceptor{}
 	ti := &mockTxHook{}
 
@@ -168,6 +176,39 @@ func initXAConnTestResource(t *testing.T) (*gomock.Controller, *sql.DB, *mockSQL
 	RegisterTxHook(ti)
 
 	return ctrl, db, mi, ti
+}
+
+func initXAConnTestResourceWithBranchReport(
+	t *testing.T,
+	branchID int64,
+	reportErr error,
+) (*gomock.Controller, *sql.DB, *int32) {
+	ctrl := gomock.NewController(t)
+
+	var phaseoneDoneReportCnt int32
+	mockMgr := mock.NewMockDataSourceManager(ctrl)
+	mockMgr.SetBranchType(branch.BranchTypeXA)
+	mockMgr.EXPECT().BranchRegister(gomock.Any(), gomock.Any()).AnyTimes().Return(branchID, nil)
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
+		func(_ context.Context, param rm.BranchReportParam) error {
+			assert.Equal(t, branchID, param.BranchId)
+			if param.Status == branch.BranchStatusPhaseoneDone {
+				atomic.AddInt32(&phaseoneDoneReportCnt, 1)
+				return reportErr
+			}
+			return nil
+		},
+	)
+	mockMgr.EXPECT().RegisterResource(gomock.Any()).AnyTimes().Return(nil)
+	mockMgr.EXPECT().CreateTableMetaCache(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().Return(nil, nil)
+	rm.GetRmCacheInstance().RegisterResourceManager(mockMgr)
+
+	db := initXAConnTestDB(t, ctrl)
+
+	exec.CleanCommonHook()
+	CleanTxHooks()
+
+	return ctrl, db, &phaseoneDoneReportCnt
 }
 
 func TestXAConn_ExecContext(t *testing.T) {
@@ -206,8 +247,7 @@ func TestXAConn_ExecContext(t *testing.T) {
 		_, err = db.ExecContext(ctx, "SELECT 1")
 		assert.NoError(t, err)
 
-		// todo fix
-		assert.Equal(t, int32(0), atomic.LoadInt32(&comitCnt))
+		assert.Equal(t, int32(2), atomic.LoadInt32(&comitCnt))
 	})
 
 	t.Run("not xid", func(t *testing.T) {
@@ -379,9 +419,8 @@ func TestXAConn_Rollback_XAER_RMFAIL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			classifier := &xa.MysqlXAErrorClassifier{}
-			if got := classifier.IsAlreadyEnded(tt.err); got != tt.want {
-				t.Errorf("MysqlXAErrorClassifier.IsAlreadyEnded() = %v, want %v", got, tt.want)
+			if got := isXAER_RMFAILAlreadyEnded(tt.err); got != tt.want {
+				t.Errorf("isXAER_RMFAILAlreadyEnded() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -424,4 +463,204 @@ func TestXAConn_Rollback_HandleXAERRMFAILAlreadyEnded(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error to trigger rollback path")
 	}
+}
+
+func TestXATx_Commit_DrivesXAFirstPhaseLifecycle(t *testing.T) {
+	ctrl, db, _, _ := initXAConnTestResource(t)
+	defer func() {
+		simulateExecContextError = nil
+		xaConnTimeout = 0
+		CleanTxHooks()
+		_ = db.Close()
+		ctrl.Finish()
+	}()
+
+	xaConnTimeout = time.Hour
+
+	var queries []string
+	simulateExecContextError = func(query string) error {
+		queries = append(queries, query)
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{})
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(context.Background(), "SELECT * FROM user")
+	require.NoError(t, err)
+
+	err = tx.Commit()
+	require.NoError(t, err)
+
+	assert.Contains(t, strings.Join(queries, "\n"), "XA START")
+	assert.Contains(t, strings.Join(queries, "\n"), "XA END")
+	assert.Contains(t, strings.Join(queries, "\n"), "XA PREPARE")
+}
+
+func TestXATx_Commit_ReturnsBranchReportErrorAfterSuccessfulPrepare(t *testing.T) {
+	reportErr := errors.New("branch report failed")
+	ctrl, db, reportCnt := initXAConnTestResourceWithBranchReport(t, 11, reportErr)
+	defer func() {
+		simulateExecContextError = nil
+		xaConnTimeout = 0
+		CleanTxHooks()
+		_ = db.Close()
+		ctrl.Finish()
+	}()
+
+	xaConnTimeout = time.Hour
+
+	var queries []string
+	simulateExecContextError = func(query string) error {
+		queries = append(queries, query)
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{})
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(context.Background(), "SELECT * FROM user")
+	require.NoError(t, err)
+
+	err = tx.Commit()
+	require.ErrorIs(t, err, reportErr)
+
+	queryLog := strings.Join(queries, "\n")
+	assert.Contains(t, queryLog, "XA START")
+	assert.Contains(t, queryLog, "XA END")
+	assert.Contains(t, queryLog, "XA PREPARE")
+	assert.Greater(t, atomic.LoadInt32(reportCnt), int32(0))
+}
+
+func TestXAConn_ExecContext_ReturnsXAFirstPhaseCommitError(t *testing.T) {
+	ctrl, db, _, _ := initXAConnTestResource(t)
+	defer func() {
+		simulateExecContextError = nil
+		xaConnTimeout = 0
+		CleanTxHooks()
+		_ = db.Close()
+		ctrl.Finish()
+	}()
+
+	xaConnTimeout = time.Hour
+
+	prepareErr := errors.New("prepare failed")
+	var queries []string
+	simulateExecContextError = func(query string) error {
+		queries = append(queries, query)
+		if strings.HasPrefix(strings.ToUpper(query), "XA PREPARE") {
+			return prepareErr
+		}
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	_, err := db.ExecContext(ctx, "SELECT 1")
+	require.ErrorIs(t, err, prepareErr)
+	assert.Contains(t, strings.Join(queries, "\n"), "XA PREPARE")
+	assert.Contains(t, strings.Join(queries, "\n"), "XA ROLLBACK")
+}
+
+func TestXAConn_ExecContext_ReturnsBranchReportErrorAfterSuccessfulPrepare(t *testing.T) {
+	reportErr := errors.New("branch report failed")
+	ctrl, db, reportCnt := initXAConnTestResourceWithBranchReport(t, 12, reportErr)
+	defer func() {
+		simulateExecContextError = nil
+		xaConnTimeout = 0
+		CleanTxHooks()
+		_ = db.Close()
+		ctrl.Finish()
+	}()
+
+	xaConnTimeout = time.Hour
+
+	var queries []string
+	simulateExecContextError = func(query string) error {
+		queries = append(queries, query)
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	_, err := db.ExecContext(ctx, "SELECT 1")
+	require.ErrorIs(t, err, reportErr)
+
+	queryLog := strings.Join(queries, "\n")
+	assert.Contains(t, queryLog, "XA START")
+	assert.Contains(t, queryLog, "XA END")
+	assert.Contains(t, queryLog, "XA PREPARE")
+	assert.Greater(t, atomic.LoadInt32(reportCnt), int32(0))
+}
+
+func TestXAConn_Commit_SetsPrepareTime(t *testing.T) {
+	branchStatusCache = gcache.New(1024).LRU().Expiration(time.Minute * 10).Build()
+	xaConnTimeout = time.Hour
+	defer func() {
+		xaConnTimeout = 0
+	}()
+
+	xaID := XaIdBuild("prepare-time-xid", 1)
+	conn := &XAConn{
+		Conn: &Conn{
+			res: &DBResource{dbType: types.DBTypeOracle},
+			txCtx: &types.TransactionContext{
+				XID:             xaID.GetGlobalXid(),
+				BranchID:        xaID.GetBranchId(),
+				TransactionMode: types.XAMode,
+			},
+		},
+		xaResource:         &fakeXAResource{},
+		xaBranchXid:        xaID,
+		xaActive:           true,
+		branchRegisterTime: time.Now(),
+	}
+
+	beforeCommit := time.Now()
+	require.NoError(t, conn.Commit(context.Background()))
+
+	assert.False(t, conn.prepareTime.IsZero())
+	assert.False(t, conn.prepareTime.Before(beforeCommit))
+	assert.WithinDuration(t, time.Now(), conn.prepareTime, time.Second)
+}
+
+func TestXATx_Rollback_DrivesXAEndAndRollback(t *testing.T) {
+	ctrl, db, _, _ := initXAConnTestResource(t)
+	defer func() {
+		simulateExecContextError = nil
+		xaConnTimeout = 0
+		CleanTxHooks()
+		_ = db.Close()
+		ctrl.Finish()
+	}()
+
+	var queries []string
+	simulateExecContextError = func(query string) error {
+		queries = append(queries, query)
+		return nil
+	}
+
+	ctx := tm.InitSeataContext(context.Background())
+	tm.SetXID(ctx, uuid.NewString())
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{})
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(context.Background(), "SELECT * FROM user")
+	require.NoError(t, err)
+
+	err = tx.Rollback()
+	require.NoError(t, err)
+
+	assert.Contains(t, strings.Join(queries, "\n"), "XA START")
+	assert.Contains(t, strings.Join(queries, "\n"), "XA END")
+	assert.Contains(t, strings.Join(queries, "\n"), "XA ROLLBACK")
 }

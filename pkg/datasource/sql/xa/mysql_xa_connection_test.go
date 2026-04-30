@@ -21,12 +21,13 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
-	"io"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/mock"
 )
@@ -247,8 +248,8 @@ func TestMysqlXAConn_Recover(t *testing.T) {
 	mockConn := mock.NewMockTestDriverConn(ctrl)
 	mockConn.EXPECT().QueryContext(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
 		func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-			rows := &mysqlMockRows{}
-			rows.data = [][]interface{}{
+			rows := &stubXARows{}
+			rows.data = [][]driver.Value{
 				{1, 3, 0, "xid"},
 				{2, 11, 0, "another_xid"},
 			}
@@ -272,36 +273,69 @@ func TestMysqlXAConn_Recover(t *testing.T) {
 	}
 }
 
-type mysqlMockRows struct {
-	idx  int
-	data [][]interface{}
+func TestMysqlXAConn_Commit_OnePhaseAppendsClause(t *testing.T) {
+	conn := &recordingXAConn{}
+	c := &MysqlXAConn{Conn: conn}
+
+	require.NoError(t, c.Commit(context.Background(), "mysql-xid", true))
+	assert.Equal(t, []string{"XA COMMIT 'mysql-xid' ONE PHASE"}, conn.execQueries)
 }
 
-func (m *mysqlMockRows) Columns() []string {
-	//TODO implement me
-	panic("implement me")
+func TestMysqlXAConn_Start_InvalidFlagDoesNotExecute(t *testing.T) {
+	conn := &recordingXAConn{}
+	c := &MysqlXAConn{Conn: conn}
+
+	err := c.Start(context.Background(), "mysql-xid", TMSuspend)
+	require.EqualError(t, err, "invalid arguments")
+	assert.Empty(t, conn.execQueries)
 }
 
-func (m *mysqlMockRows) Close() error {
-	//TODO implement me
-	panic("implement me")
+func TestMysqlXAConn_End_SuspendAndInvalidFlag(t *testing.T) {
+	t.Run("suspend", func(t *testing.T) {
+		conn := &recordingXAConn{}
+		c := &MysqlXAConn{Conn: conn}
+
+		require.NoError(t, c.End(context.Background(), "mysql-xid", TMSuspend))
+		assert.Equal(t, []string{"XA END 'mysql-xid' SUSPEND"}, conn.execQueries)
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		conn := &recordingXAConn{}
+		c := &MysqlXAConn{Conn: conn}
+
+		err := c.End(context.Background(), "mysql-xid", TMJoin)
+		require.EqualError(t, err, "invalid arguments")
+		assert.Empty(t, conn.execQueries)
+	})
 }
 
-func (m *mysqlMockRows) Next(dest []driver.Value) error {
-	if m.idx == len(m.data) {
-		return io.EOF
+func TestMysqlXAConn_Recover_ProtocolValidation(t *testing.T) {
+	conn := &recordingXAConn{
+		queryRows: &stubXARows{
+			data: [][]driver.Value{
+				{1, 3, 0, 123},
+			},
+		},
 	}
+	c := &MysqlXAConn{Conn: conn}
 
-	min := func(a, b int) int {
-		if a < b {
-			return a
-		}
-		return b
-	}
-	cnt := min(len(m.data[0]), len(dest))
-	for i := 0; i < cnt; i++ {
-		dest[i] = m.data[m.idx][i]
-	}
-	m.idx++
-	return nil
+	xids, err := c.Recover(context.Background(), TMStartRScan)
+	require.EqualError(t, err, "the protocol of XA RECOVER statement is error")
+	assert.Nil(t, xids)
+	assert.Equal(t, []string{"XA RECOVER"}, conn.queryQueries)
+}
+
+func TestMysqlXAConn_Recover_EndScanDoesNotQuery(t *testing.T) {
+	conn := &recordingXAConn{}
+	c := &MysqlXAConn{Conn: conn}
+
+	xids, err := c.Recover(context.Background(), TMEndRScan)
+	require.NoError(t, err)
+	assert.Nil(t, xids)
+	assert.Empty(t, conn.queryQueries)
+}
+
+func TestMysqlXAConn_Forget_NotSupported(t *testing.T) {
+	c := &MysqlXAConn{}
+	require.EqualError(t, c.Forget(context.Background(), "mysql-xid"), "mysql doesn't support this")
 }

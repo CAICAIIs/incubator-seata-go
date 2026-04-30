@@ -20,92 +20,487 @@ package xa
 import (
 	"context"
 	"database/sql/driver"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"math"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
-	"seata.apache.org/seata-go/v2/pkg/datasource/sql/types"
 	"seata.apache.org/seata-go/v2/pkg/util/log"
 )
 
-func init() {
-	RegisterXAResourceFactory(types.DBTypeOracle, &oracleXAResourceFactory{})
-}
+const (
+	oracleXADefaultTimeout = 60 * time.Second
+	oracleXAMaxXIDPartSize = 64
+	oracleXAFormatID       = 0x53474F
 
-type oracleXAResourceFactory struct{}
+	oracleXAOK       = 0
+	oracleXAReadonly = 3
+	oracleXARetry    = 4
+	oracleXAHeurMix  = 5
+	oracleXAHeurRB   = 6
+	oracleXAHeurCom  = 7
+	oracleXAHeurHaz  = 8
 
-func (f *oracleXAResourceFactory) CreateXAResource(conn driver.Conn) XAResource {
-	return &OracleXAConn{Conn: conn}
-}
+	oracleXAERRMErr   = -3
+	oracleXAERNota    = -4
+	oracleXAERInval   = -5
+	oracleXAERProto   = -6
+	oracleXAERRMFail  = -7
+	oracleXAERDupID   = -8
+	oracleXAEROutside = -9
+)
 
-func (f *oracleXAResourceFactory) CreateErrorClassifier() XAErrorClassifier {
-	return &OracleXAErrorClassifier{}
-}
+var (
+	_ XAResource = (*OracleXAConn)(nil)
 
-// OracleXAErrorClassifier classifies Oracle-specific XA errors.
-type OracleXAErrorClassifier struct{}
+	oracleXAResultPattern      = regexp.MustCompile(`DBMS_XA\.(XA_[A-Z_]+):ret=(-?\d+),oer=(-?\d+)`)
+	errOracleXARecoverProtocol = errors.New("the protocol of oracle XA RECOVER statement is error")
+)
 
-func (c *OracleXAErrorClassifier) IsAlreadyEnded(err error) bool {
-	// TODO: check ORA-24756 (transaction does not exist) / ORA-24761 (rolled back)
-	return false
-}
-
-// OracleXAConn implements XAResource for Oracle using the DBMS_XA PL/SQL package.
-//
-// Oracle does NOT support MySQL-style XA SQL statements.
-// All operations go through PL/SQL anonymous blocks calling DBMS_XA:
-//   - DBMS_XA.XA_START / XA_END / XA_PREPARE / XA_COMMIT / XA_ROLLBACK
-//   - XID type: DBMS_XA_XID(formatid NUMBER, gtrid RAW(64), bqual RAW(64))
-//   - Recovery: DBA_PENDING_TRANSACTIONS or DBMS_XA.XA_RECOVER
-//   - Requires: GRANT EXECUTE ON DBMS_XA TO <user>
 type OracleXAConn struct {
 	driver.Conn
+	timeout time.Duration
 }
 
-func (c *OracleXAConn) Start(ctx context.Context, xid string, flags int) error {
-	log.Infof("xa branch start (oracle), xid %s", xid)
-	// TODO: DBMS_XA.XA_START via PL/SQL block, map xid to DBMS_XA_XID
-	return fmt.Errorf("Oracle XA start not yet implemented")
+type oracleXID struct {
+	formatID            int
+	globalTransactionID []byte
+	branchQualifier     []byte
 }
 
-func (c *OracleXAConn) End(ctx context.Context, xid string, flags int) error {
-	log.Infof("xa branch end (oracle), xid %s", xid)
-	// TODO: DBMS_XA.XA_END via PL/SQL block
-	return fmt.Errorf("Oracle XA end not yet implemented")
+type oracleXAError struct {
+	operation  string
+	resultCode int
+	oracleCode int
+	cause      error
 }
 
-func (c *OracleXAConn) XAPrepare(ctx context.Context, xid string) error {
-	log.Infof("xa branch prepare (oracle), xid %s", xid)
-	// TODO: DBMS_XA.XA_PREPARE via PL/SQL block
-	return fmt.Errorf("Oracle XA prepare not yet implemented")
+func (e *oracleXAError) Error() string {
+	return fmt.Sprintf("oracle %s returned %d (oer=%d): %v", e.operation, e.resultCode, e.oracleCode, e.cause)
+}
+
+func (e *oracleXAError) Unwrap() error {
+	return e.cause
+}
+
+func NewOracleXaConn(conn driver.Conn) *OracleXAConn {
+	return &OracleXAConn{
+		Conn:    conn,
+		timeout: oracleXADefaultTimeout,
+	}
 }
 
 func (c *OracleXAConn) Commit(ctx context.Context, xid string, onePhase bool) error {
-	log.Infof("xa branch commit (oracle), xid %s, onePhase %v", xid, onePhase)
-	// TODO: DBMS_XA.XA_COMMIT via PL/SQL block
-	return fmt.Errorf("Oracle XA commit not yet implemented")
-}
-
-func (c *OracleXAConn) Rollback(ctx context.Context, xid string) error {
-	log.Infof("xa branch rollback (oracle), xid %s", xid)
-	// TODO: DBMS_XA.XA_ROLLBACK via PL/SQL block
-	return fmt.Errorf("Oracle XA rollback not yet implemented")
-}
-
-func (c *OracleXAConn) Recover(ctx context.Context, flag int) ([]string, error) {
-	if (flag & TMStartRScan) == 0 {
-		return nil, nil
+	xaXID, err := oracleXABranchXid(xid)
+	if err != nil {
+		return err
 	}
-	// TODO: SELECT globalid, branchid FROM DBA_PENDING_TRANSACTIONS
-	return nil, fmt.Errorf("Oracle XA recover not yet implemented")
+
+	plsql := oracleXAWithXidBlock(
+		"XA_COMMIT",
+		xaXID,
+		fmt.Sprintf("DBMS_XA.XA_COMMIT(l_xid, %s)", oracleBooleanLiteral(onePhase)),
+		oracleXAOK,
+	)
+	return c.exec(ctx, plsql)
+}
+
+func (c *OracleXAConn) End(ctx context.Context, xid string, flags int) error {
+	xaXID, err := oracleXABranchXid(xid)
+	if err != nil {
+		return err
+	}
+
+	flagExpr, err := oracleXAEndFlag(flags)
+	if err != nil {
+		return err
+	}
+
+	plsql := oracleXAWithXidBlock(
+		"XA_END",
+		xaXID,
+		fmt.Sprintf("DBMS_XA.XA_END(l_xid, %s)", flagExpr),
+		oracleXAOK,
+	)
+	return c.exec(ctx, plsql)
 }
 
 func (c *OracleXAConn) Forget(ctx context.Context, xid string) error {
-	// TODO: DBMS_XA.XA_FORGET via PL/SQL block
-	return fmt.Errorf("Oracle XA forget not yet implemented")
+	xaXID, err := oracleXABranchXid(xid)
+	if err != nil {
+		return err
+	}
+
+	plsql := oracleXAWithXidBlock("XA_FORGET", xaXID, "DBMS_XA.XA_FORGET(l_xid)", oracleXAOK)
+	err = c.exec(ctx, plsql)
+	if isOracleXAResultCode(err, oracleXAERNota) {
+		return nil
+	}
+	return err
 }
 
-func (c *OracleXAConn) GetTransactionTimeout() time.Duration { return 0 }
+func (c *OracleXAConn) GetTransactionTimeout() time.Duration {
+	return c.timeout
+}
 
-func (c *OracleXAConn) IsSameRM(ctx context.Context, resource XAResource) bool { return false }
+func (c *OracleXAConn) IsSameRM(ctx context.Context, resource XAResource) bool {
+	other, ok := resource.(*OracleXAConn)
+	if !ok {
+		return false
+	}
+	return c.Conn == other.Conn
+}
 
-func (c *OracleXAConn) SetTransactionTimeout(duration time.Duration) bool { return false }
+func (c *OracleXAConn) XAPrepare(ctx context.Context, xid string) error {
+	xaXID, err := oracleXABranchXid(xid)
+	if err != nil {
+		return err
+	}
+
+	plsql := oracleXAWithXidBlock("XA_PREPARE", xaXID, "DBMS_XA.XA_PREPARE(l_xid)", oracleXAOK, oracleXAReadonly)
+	return c.exec(ctx, plsql)
+}
+
+func (c *OracleXAConn) Recover(ctx context.Context, flag int) ([]string, error) {
+	if err := oracleXARecoverFlag(flag); err != nil {
+		return nil, err
+	}
+	startRscan := (flag & TMStartRScan) > 0
+	if !startRscan {
+		return nil, nil
+	}
+
+	queryer, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+
+	rows, err := queryer.QueryContext(ctx,
+		"SELECT x.formatid, RAWTOHEX(x.gtrid), RAWTOHEX(x.bqual) FROM TABLE(DBMS_XA.XA_RECOVER()) x", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var xids []string
+	dest := make([]driver.Value, 3)
+	for {
+		if err = rows.Next(dest); err != nil {
+			if errors.Is(err, io.EOF) {
+				return xids, nil
+			}
+			return nil, err
+		}
+
+		formatID, err := oracleInt(dest[0])
+		if err != nil {
+			return nil, err
+		}
+		if formatID != oracleXAFormatID {
+			continue
+		}
+
+		globalXidRawHex, err := oracleRawHex(dest[1])
+		if err != nil {
+			return nil, err
+		}
+		branchQualifierRawHex, err := oracleRawHex(dest[2])
+		if err != nil {
+			return nil, err
+		}
+
+		globalXidRaw, err := hex.DecodeString(globalXidRawHex)
+		if err != nil {
+			return nil, fmt.Errorf("decode oracle recovered gtrid failed: %w", err)
+		}
+		branchQualifierRaw, err := hex.DecodeString(branchQualifierRawHex)
+		if err != nil {
+			return nil, fmt.Errorf("decode oracle recovered bqual failed: %w", err)
+		}
+
+		recoveredXID, err := oracleRecoveredXID(globalXidRaw, branchQualifierRaw)
+		if err != nil {
+			return nil, err
+		}
+		xids = append(xids, recoveredXID)
+	}
+}
+
+func (c *OracleXAConn) Rollback(ctx context.Context, xid string) error {
+	xaXID, err := oracleXABranchXid(xid)
+	if err != nil {
+		return err
+	}
+
+	plsql := oracleXAWithXidBlock("XA_ROLLBACK", xaXID, "DBMS_XA.XA_ROLLBACK(l_xid)", oracleXAOK)
+	err = c.exec(ctx, plsql)
+	if isOracleXAResultCode(err, oracleXAERNota) {
+		return nil
+	}
+	return err
+}
+
+func (c *OracleXAConn) SetTransactionTimeout(duration time.Duration) bool {
+	if duration < 0 {
+		return false
+	}
+
+	timeoutSeconds := int(math.Ceil(duration.Seconds()))
+	if duration > 0 && timeoutSeconds == 0 {
+		timeoutSeconds = 1
+	}
+
+	plsql := oracleXAWithoutXidBlock("XA_SETTIMEOUT",
+		fmt.Sprintf("DBMS_XA.XA_SETTIMEOUT(%d)", timeoutSeconds), oracleXAOK)
+	if err := c.exec(context.Background(), plsql); err != nil {
+		return false
+	}
+
+	c.timeout = time.Duration(timeoutSeconds) * time.Second
+	return true
+}
+
+func (c *OracleXAConn) Start(ctx context.Context, xid string, flags int) error {
+	xaXID, err := oracleXABranchXid(xid)
+	if err != nil {
+		return err
+	}
+
+	flagExpr, err := oracleXAStartFlag(flags)
+	if err != nil {
+		return err
+	}
+
+	plsql := oracleXAWithXidBlock(
+		"XA_START",
+		xaXID,
+		fmt.Sprintf("DBMS_XA.XA_START(l_xid, %s)", flagExpr),
+		oracleXAOK,
+	)
+	return c.exec(ctx, plsql)
+}
+
+func (c *OracleXAConn) exec(ctx context.Context, query string) error {
+	conn, ok := c.Conn.(driver.ExecerContext)
+	if !ok {
+		return driver.ErrSkip
+	}
+
+	_, err := conn.ExecContext(ctx, query, nil)
+	if err == nil {
+		return nil
+	}
+
+	if xaErr := parseOracleXAError(err); xaErr != nil {
+		log.Errorf("oracle xa %s failed, result=%d, oer=%d, err=%v", xaErr.operation, xaErr.resultCode, xaErr.oracleCode, err)
+		return xaErr
+	}
+
+	return err
+}
+
+func oracleXABranchXid(xid string) (*oracleXID, error) {
+	branchSplitIdx := strings.LastIndex(xid, "-")
+	if branchSplitIdx <= 0 || branchSplitIdx == len(xid)-1 {
+		return nil, fmt.Errorf("invalid xa branch xid: %s", xid)
+	}
+
+	if _, err := strconv.ParseUint(xid[branchSplitIdx+1:], 10, 64); err != nil {
+		return nil, fmt.Errorf("invalid xa branch xid: %s", xid)
+	}
+
+	xaXID := &oracleXID{
+		formatID:            oracleXAFormatID,
+		globalTransactionID: []byte(xid[:branchSplitIdx]),
+		branchQualifier:     []byte(xid[branchSplitIdx:]),
+	}
+
+	if len(xaXID.globalTransactionID) == 0 {
+		return nil, errors.New("invalid arguments")
+	}
+	if len(xaXID.globalTransactionID) > oracleXAMaxXIDPartSize {
+		return nil, fmt.Errorf("oracle xa gtrid exceeds %d bytes", oracleXAMaxXIDPartSize)
+	}
+	if len(xaXID.branchQualifier) == 0 {
+		return nil, errors.New("invalid arguments")
+	}
+	if len(xaXID.branchQualifier) > oracleXAMaxXIDPartSize {
+		return nil, fmt.Errorf("oracle xa bqual exceeds %d bytes", oracleXAMaxXIDPartSize)
+	}
+	return xaXID, nil
+}
+
+func oracleXAStartFlag(flags int) (string, error) {
+	switch flags {
+	case TMNoFlags:
+		return "DBMS_XA.TMNOFLAGS", nil
+	case TMJoin:
+		return "DBMS_XA.TMJOIN", nil
+	case TMResume:
+		return "DBMS_XA.TMRESUME", nil
+	default:
+		return "", errors.New("invalid arguments")
+	}
+}
+
+func oracleXAEndFlag(flags int) (string, error) {
+	switch flags {
+	case TMSuccess, TMFail:
+		// Oracle DBMS_XA does not support TMFAIL. We detach with TMSUCCESS and
+		// let the following XA_ROLLBACK complete the rollback-only path.
+		return "DBMS_XA.TMSUCCESS", nil
+	case TMSuspend:
+		return "DBMS_XA.TMSUSPEND", nil
+	default:
+		return "", errors.New("invalid arguments")
+	}
+}
+
+func oracleXARecoverFlag(flags int) error {
+	allowed := TMStartRScan | TMEndRScan
+	if flags&^allowed != 0 {
+		return errors.New("invalid arguments")
+	}
+	return nil
+}
+
+func oracleXAWithXidBlock(operation string, xid *oracleXID, statement string, successCodes ...int) string {
+	return fmt.Sprintf(`DECLARE
+	l_xid DBMS_XA_XID := DBMS_XA_XID(%d, HEXTORAW('%s'), HEXTORAW('%s'));
+	l_ret PLS_INTEGER;
+BEGIN
+	l_ret := %s;
+	IF l_ret NOT IN (%s) THEN
+		RAISE_APPLICATION_ERROR(-20000, 'DBMS_XA.%s:ret=' || TO_CHAR(l_ret) || ',oer=' || TO_CHAR(DBMS_XA.XA_GETLASTOER()));
+	END IF;
+END;`,
+		xid.formatID,
+		hex.EncodeToString(xid.globalTransactionID),
+		hex.EncodeToString(xid.branchQualifier),
+		statement,
+		oracleXAResultList(successCodes...),
+		operation,
+	)
+}
+
+func oracleXAWithoutXidBlock(operation string, statement string, successCodes ...int) string {
+	return fmt.Sprintf(`DECLARE
+	l_ret PLS_INTEGER;
+BEGIN
+	l_ret := %s;
+	IF l_ret NOT IN (%s) THEN
+		RAISE_APPLICATION_ERROR(-20000, 'DBMS_XA.%s:ret=' || TO_CHAR(l_ret) || ',oer=' || TO_CHAR(DBMS_XA.XA_GETLASTOER()));
+	END IF;
+END;`,
+		statement,
+		oracleXAResultList(successCodes...),
+		operation,
+	)
+}
+
+func oracleXAResultList(resultCodes ...int) string {
+	values := make([]string, 0, len(resultCodes))
+	for _, resultCode := range resultCodes {
+		values = append(values, strconv.Itoa(resultCode))
+	}
+	return strings.Join(values, ", ")
+}
+
+func oracleRawHex(raw driver.Value) (string, error) {
+	switch value := raw.(type) {
+	case string:
+		return value, nil
+	case []byte:
+		return string(value), nil
+	default:
+		return "", errOracleXARecoverProtocol
+	}
+}
+
+func oracleInt(raw driver.Value) (int, error) {
+	switch value := raw.(type) {
+	case int:
+		return value, nil
+	case int32:
+		return int(value), nil
+	case int64:
+		return int(value), nil
+	case float64:
+		if value != math.Trunc(value) {
+			return 0, errOracleXARecoverProtocol
+		}
+		return int(value), nil
+	case string:
+		return oracleParseInt(value)
+	case []byte:
+		return oracleParseInt(string(value))
+	default:
+		return 0, errOracleXARecoverProtocol
+	}
+}
+
+func oracleParseInt(value string) (int, error) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, errOracleXARecoverProtocol
+	}
+	return parsed, nil
+}
+
+func oracleRecoveredXID(globalTransactionID []byte, branchQualifier []byte) (string, error) {
+	branchQualifierValue := string(branchQualifier)
+	if !strings.HasPrefix(branchQualifierValue, "-") {
+		return "", errOracleXARecoverProtocol
+	}
+	if _, err := strconv.ParseUint(strings.TrimPrefix(branchQualifierValue, "-"), 10, 64); err != nil {
+		return "", errOracleXARecoverProtocol
+	}
+	return string(globalTransactionID) + branchQualifierValue, nil
+}
+
+func oracleBooleanLiteral(value bool) string {
+	if value {
+		return "TRUE"
+	}
+	return "FALSE"
+}
+
+func parseOracleXAError(err error) *oracleXAError {
+	if err == nil {
+		return nil
+	}
+
+	matches := oracleXAResultPattern.FindStringSubmatch(err.Error())
+	if len(matches) != 4 {
+		return nil
+	}
+
+	resultCode, convErr := strconv.Atoi(matches[2])
+	if convErr != nil {
+		return nil
+	}
+	oracleCode, convErr := strconv.Atoi(matches[3])
+	if convErr != nil {
+		return nil
+	}
+
+	return &oracleXAError{
+		operation:  matches[1],
+		resultCode: resultCode,
+		oracleCode: oracleCode,
+		cause:      err,
+	}
+}
+
+func isOracleXAResultCode(err error, resultCode int) bool {
+	var xaErr *oracleXAError
+	if !errors.As(err, &xaErr) {
+		return false
+	}
+	return xaErr.resultCode == resultCode
+}

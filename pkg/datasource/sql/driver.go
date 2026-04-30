@@ -24,10 +24,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"reflect"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
+	go_ora "github.com/sijms/go-ora/v2"
 
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/datasource"
 	mysql2 "seata.apache.org/seata-go/v2/pkg/datasource/sql/datasource/mysql"
@@ -42,6 +44,8 @@ const (
 	SeataATMySQLDriver = "seata-at-mysql"
 	// SeataXAMySQLDriver MySQL driver for XA mode
 	SeataXAMySQLDriver = "seata-xa-mysql"
+	// SeataXAOracleDriver Oracle driver for XA mode
+	SeataXAOracleDriver = "seata-xa-oracle"
 )
 
 func initDriver() {
@@ -50,6 +54,7 @@ func initDriver() {
 			branchType: branch.BranchTypeAT,
 			transType:  types.ATMode,
 			target:     mysql.MySQLDriver{},
+			driverName: "mysql",
 		},
 	})
 
@@ -58,6 +63,16 @@ func initDriver() {
 			branchType: branch.BranchTypeXA,
 			transType:  types.XAMode,
 			target:     mysql.MySQLDriver{},
+			driverName: "mysql",
+		},
+	})
+
+	sql.Register(SeataXAOracleDriver, &seataXADriver{
+		seataDriver: &seataDriver{
+			branchType: branch.BranchTypeXA,
+			transType:  types.XAMode,
+			target:     &go_ora.OracleDriver{},
+			driverName: "oracle",
 		},
 	})
 }
@@ -74,8 +89,10 @@ func (d *seataATDriver) OpenConnector(name string) (c driver.Connector, err erro
 
 	_connector, _ := connector.(*seataConnector)
 	_connector.transType = types.ATMode
-	cfg, _ := mysql.ParseDSN(name)
-	_connector.cfg = cfg
+	if d.getTargetDriverName() == "mysql" {
+		cfg, _ := mysql.ParseDSN(name)
+		_connector.cfg = cfg
+	}
 
 	return &seataATConnector{
 		seataConnector: _connector,
@@ -94,8 +111,10 @@ func (d *seataXADriver) OpenConnector(name string) (c driver.Connector, err erro
 
 	_connector, _ := connector.(*seataConnector)
 	_connector.transType = types.XAMode
-	cfg, _ := mysql.ParseDSN(name)
-	_connector.cfg = cfg
+	if d.getTargetDriverName() == "mysql" {
+		cfg, _ := mysql.ParseDSN(name)
+		_connector.cfg = cfg
+	}
 
 	return &seataXAConnector{
 		seataConnector: _connector,
@@ -106,6 +125,7 @@ type seataDriver struct {
 	branchType branch.BranchType
 	transType  types.TransactionMode
 	target     driver.Driver
+	driverName string
 }
 
 // Open never be called, because seataDriver implemented dri.DriverContext interface.
@@ -141,13 +161,13 @@ func (d *seataDriver) OpenConnector(name string) (c driver.Connector, err error)
 
 func (d *seataDriver) getOpenConnectorProxy(connector driver.Connector, dbType types.DBType,
 	db *sql.DB, dataSourceName string) (driver.Connector, error) {
-	cfg, _ := mysql.ParseDSN(dataSourceName)
+	var cfg *mysql.Config
 	options := []dbOption{
 		withResourceID(parseResourceID(dataSourceName)),
 		withTarget(db),
 		withBranchType(d.branchType),
 		withDBType(dbType),
-		withDBName(cfg.DBName),
+		withDBName(parseDBName(dataSourceName, dbType)),
 		withConnector(connector),
 	}
 	res, err := newResource(options...)
@@ -155,7 +175,10 @@ func (d *seataDriver) getOpenConnectorProxy(connector driver.Connector, dbType t
 		log.Errorf("create new resource: %v", err)
 		return nil, err
 	}
-	datasource.RegisterTableCache(types.DBTypeMySQL, mysql2.NewTableMetaInstance(db, cfg))
+	if dbType == types.DBTypeMySQL {
+		cfg, _ = mysql.ParseDSN(dataSourceName)
+		datasource.RegisterTableCache(types.DBTypeMySQL, mysql2.NewTableMetaInstance(db, cfg))
+	}
 	if err = datasource.GetDataSourceManager(d.branchType).RegisterResource(res); err != nil {
 		log.Errorf("register resource: %v", err)
 		return nil, err
@@ -168,7 +191,52 @@ func (d *seataDriver) getOpenConnectorProxy(connector driver.Connector, dbType t
 }
 
 func (d *seataDriver) getTargetDriverName() string {
-	return "mysql"
+	if d.driverName != "" {
+		return d.driverName
+	}
+	switch d.target.(type) {
+	case mysql.MySQLDriver, *mysql.MySQLDriver:
+		return "mysql"
+	case *go_ora.OracleDriver:
+		return "oracle"
+	default:
+		return ""
+	}
+}
+
+func dbTypeDriverName(dbType types.DBType) string {
+	switch dbType {
+	case types.DBTypeMySQL:
+		return "mysql"
+	case types.DBTypeMARIADB:
+		return "mariadb"
+	case types.DBTypeOracle:
+		return "oracle"
+	default:
+		return ""
+	}
+}
+
+func parseDBName(dataSourceName string, dbType types.DBType) string {
+	switch dbType {
+	case types.DBTypeMySQL, types.DBTypeMARIADB:
+		cfg, err := mysql.ParseDSN(dataSourceName)
+		if err != nil {
+			return ""
+		}
+		return cfg.DBName
+	case types.DBTypeOracle:
+		u, err := url.Parse(dataSourceName)
+		if err != nil {
+			return ""
+		}
+		if serviceName := strings.Trim(u.Path, "/"); serviceName != "" {
+			return serviceName
+		}
+		return u.Query().Get("SERVICE NAME")
+	default:
+		return ""
+	}
 }
 
 type dsnConnector struct {

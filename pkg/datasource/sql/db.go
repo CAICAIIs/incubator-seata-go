@@ -125,6 +125,10 @@ func (db *DBResource) GetResourceGroupId() string {
 }
 
 func (db *DBResource) init() {
+	if db.dbType != types.DBTypeMySQL && db.dbType != types.DBTypeMARIADB {
+		return
+	}
+
 	ctx := context.Background()
 	conn, err := db.connector.Connect(ctx)
 	if err != nil {
@@ -230,9 +234,8 @@ func (db *DBResource) ConnectionForXA(ctx context.Context, xaXid XAXid) (*XAConn
 			targetConn: newDriverConn,
 			res:        db,
 		},
-		xaBranchXid:       XaIdBuild(xaXid.GetGlobalXid(), xaXid.GetBranchId()),
-		xaResource:        xaResource,
-		xaErrorClassifier: xa.CreateErrorClassifier(db.dbType),
+		xaBranchXid: XaIdBuild(xaXid.GetGlobalXid(), xaXid.GetBranchId()),
+		xaResource:  xaResource,
 	}
 	return xaConn, nil
 }

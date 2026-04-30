@@ -18,6 +18,7 @@
 package sql
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -43,4 +44,58 @@ func TestXABranchXidBuildWithByte(t *testing.T) {
 
 	assert.Equal(t, x.GetGlobalXid(), "111")
 	assert.Equal(t, x.GetBranchId(), uint64(222))
+}
+
+func TestXABranchXid_RoundTripCompositeXID(t *testing.T) {
+	globalXid := "127.0.0.1:8091:202604280001"
+	branchID := uint64(9876543210)
+
+	built := XaIdBuild(globalXid, branchID)
+	rebuilt := XaIdBuildWithByte(built.GetGlobalTransactionId(), built.GetBranchQualifier())
+
+	assert.Equal(t, globalXid, rebuilt.GetGlobalXid())
+	assert.Equal(t, branchID, rebuilt.GetBranchId())
+	assert.Equal(t, globalXid+"-"+strconv.FormatUint(branchID, 10), rebuilt.String())
+}
+
+func TestParseXABranchXid(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantXID   string
+		wantBID   uint64
+		expectErr bool
+	}{
+		{
+			name:    "valid composite xid",
+			input:   "oracle-global-xid-42",
+			wantXID: "oracle-global-xid",
+			wantBID: 42,
+		},
+		{
+			name:      "missing branch id",
+			input:     "oracle-global-xid",
+			expectErr: true,
+		},
+		{
+			name:      "invalid branch id",
+			input:     "oracle-global-xid-not-a-number",
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			xaXID, err := ParseXABranchXid(tt.input)
+			if tt.expectErr {
+				assert.Error(t, err)
+				assert.Nil(t, xaXID)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantXID, xaXID.GetGlobalXid())
+			assert.Equal(t, tt.wantBID, xaXID.GetBranchId())
+		})
+	}
 }
