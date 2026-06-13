@@ -140,8 +140,8 @@ func TestEtcd3RegistryService_Lookup(t *testing.T) {
 			vgroupMapping: map[string]string{
 				"default_tx_group": "default",
 			},
-			grouplist: make(map[string][]*ServiceInstance, 0),
-			stopCh:    make(chan struct{}),
+			store:  NewAddressStore(),
+			stopCh: make(chan struct{}),
 		}
 
 		mockEtcdClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(tt.getResp, nil)
@@ -174,5 +174,20 @@ func TestEtcd3RegistryService_Lookup(t *testing.T) {
 		assert.True(t, reflect.DeepEqual(serviceInstances, tt.want))
 
 		etcdRegistryService.Close()
+	}
+}
+
+func TestEtcd3RegistryService_CloseIsRepeatable(t *testing.T) {
+	etcdRegistryService := &EtcdRegistryService{
+		stopCh: make(chan struct{}),
+	}
+
+	etcdRegistryService.Close()
+	etcdRegistryService.Close()
+
+	select {
+	case <-etcdRegistryService.stopCh:
+	case <-time.After(time.Second):
+		t.Fatal("stop channel was not closed")
 	}
 }
