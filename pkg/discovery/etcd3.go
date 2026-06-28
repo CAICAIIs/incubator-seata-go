@@ -19,6 +19,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -204,10 +205,14 @@ func (s *EtcdRegistryService) Lookup(key string) ([]*ServiceInstance, error) {
 }
 
 func (s *EtcdRegistryService) Close() {
-	if s.stopCh == nil {
-		return
-	}
 	s.closeOnce.Do(func() {
-		close(s.stopCh)
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+		if s.client != nil {
+			if err := s.client.Close(); err != nil && !errors.Is(err, context.Canceled) {
+				log.Warnf("close etcd client failed: %v", err)
+			}
+		}
 	})
 }
