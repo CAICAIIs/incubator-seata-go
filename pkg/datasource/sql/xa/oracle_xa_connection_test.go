@@ -218,6 +218,17 @@ func TestOracleXAConn_PrepareReturnsOracleRetAndOER(t *testing.T) {
 	assert.Contains(t, conn.queryQueries[1], "DBMS_XA.XA_GETLASTOER()")
 }
 
+func TestOracleXAErrorClassifier_DoesNotTreatTransactionMissingAsCommitted(t *testing.T) {
+	classifier := &OracleXAErrorClassifier{}
+	transactionMissingErr := errors.New("ORA-24756: transaction does not exist")
+	rollbackedErr := errors.New("ORA-24761: transaction rolled back")
+
+	assert.True(t, classifier.IsAlreadyEnded(transactionMissingErr))
+	assert.False(t, classifier.IsAlreadyCommitted(transactionMissingErr))
+	assert.False(t, classifier.IsAlreadyRollbacked(transactionMissingErr))
+	assert.True(t, classifier.IsAlreadyRollbacked(rollbackedErr))
+}
+
 func TestOracleXAConn_UnsupportedOperationsReturnExplicitErrors(t *testing.T) {
 	c := NewOracleXaConn(&recordingOracleXAConn{})
 

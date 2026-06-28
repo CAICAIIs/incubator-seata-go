@@ -61,7 +61,7 @@ func (c *OracleXAErrorClassifier) IsAlreadyEnded(err error) bool {
 }
 
 func (c *OracleXAErrorClassifier) IsAlreadyCommitted(err error) bool {
-	return oracleXAHasErrorCode(err, "24756")
+	return false
 }
 
 func (c *OracleXAErrorClassifier) IsAlreadyRollbacked(err error) bool {

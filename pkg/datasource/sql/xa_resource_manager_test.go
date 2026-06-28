@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
+	"github.com/bluele/gcache"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -90,6 +91,22 @@ func (f *fakeXAResource) SetTransactionTimeout(time.Duration) bool {
 
 func (f *fakeXAResource) Start(context.Context, string, int) error {
 	return nil
+}
+
+type fakeXAErrorClassifier struct {
+	alreadyRollbacked error
+}
+
+func (f fakeXAErrorClassifier) IsAlreadyEnded(err error) bool {
+	return f.IsAlreadyRollbacked(err)
+}
+
+func (f fakeXAErrorClassifier) IsAlreadyCommitted(err error) bool {
+	return false
+}
+
+func (f fakeXAErrorClassifier) IsAlreadyRollbacked(err error) bool {
+	return f.alreadyRollbacked != nil && errors.Is(err, f.alreadyRollbacked)
 }
 
 type closeTrackingConn struct {
@@ -459,6 +476,103 @@ func TestXAResourceManager_BranchRollback_IgnoresTargetRollbackErrorAfterXARollb
 	assert.Equal(t, 1, targetConn.closeCalls)
 }
 
+func TestXAResourceManager_BranchRollback_CachesTerminalRollback(t *testing.T) {
+	tests := []struct {
+		name        string
+		suffix      string
+		rollbackErr error
+	}{
+		{name: "rollback succeeds", suffix: "success"},
+		{
+			name:        "rollback already completed",
+			suffix:      "already",
+			rollbackErr: errors.New("already rollbacked"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withBranchStatusCache(t)
+
+			xaID := XaIdBuild("rollback-cache-"+tt.suffix, 35)
+			fakeResource := &fakeXAResource{rollbackErr: tt.rollbackErr}
+			targetConn := &closeTrackingConn{}
+			dbResource := &DBResource{
+				resourceID:   "resource-rollback-cache-" + tt.suffix,
+				dbType:       types.DBTypeMySQL,
+				shouldBeHeld: true,
+			}
+			heldConn := &XAConn{
+				Conn: &Conn{
+					targetConn: targetConn,
+					res:        dbResource,
+				},
+				xaBranchXid: xaID,
+				xaResource:  fakeResource,
+				isConnKept:  true,
+			}
+			if tt.rollbackErr != nil {
+				heldConn.xaErrorClassifier = fakeXAErrorClassifier{alreadyRollbacked: tt.rollbackErr}
+			}
+			require.NoError(t, dbResource.Hold(xaID.String(), heldConn))
+
+			manager := &XAResourceManager{}
+			manager.resourceCache.Store(dbResource.resourceID, dbResource)
+			resource := rm.BranchResource{
+				ResourceId: dbResource.resourceID,
+				Xid:        xaID.GetGlobalXid(),
+				BranchId:   int64(xaID.GetBranchId()),
+			}
+
+			status, err := manager.BranchRollback(context.Background(), resource)
+			require.NoError(t, err)
+			assert.EqualValues(t, branch.BranchStatusPhasetwoRollbacked, status)
+
+			status, err = manager.BranchRollback(context.Background(), resource)
+			require.NoError(t, err)
+			assert.EqualValues(t, branch.BranchStatusPhasetwoRollbacked, status)
+			assert.Equal(t, []string{xaID.String()}, fakeResource.rollbackXIDs)
+			assert.Equal(t, 1, targetConn.closeCalls)
+		})
+	}
+}
+
+func TestXAResourceManager_BranchCommit_FailsWhenRollbackedStatusIsCached(t *testing.T) {
+	withBranchStatusCache(t)
+
+	xaID := XaIdBuild("commit-after-rollback-xid", 37)
+	setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoRollbacked)
+
+	manager := &XAResourceManager{}
+	status, err := manager.BranchCommit(context.Background(), rm.BranchResource{
+		ResourceId: "unused-resource",
+		Xid:        xaID.GetGlobalXid(),
+		BranchId:   int64(xaID.GetBranchId()),
+	})
+
+	require.Error(t, err)
+	assert.EqualValues(t, branch.BranchStatusPhasetwoCommitFailedUnretryable, status)
+	assert.Contains(t, err.Error(), "already rollbacked")
+}
+
+func TestXAResourceManager_BranchRollback_FailsWhenCommittedStatusIsCached(t *testing.T) {
+	withBranchStatusCache(t)
+
+	xaID := XaIdBuild("rollback-after-commit-xid", 38)
+	setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoCommitted)
+
+	manager := &XAResourceManager{}
+	status, err := manager.BranchRollback(context.Background(), rm.BranchResource{
+		ResourceId: "unused-resource",
+		Xid:        xaID.GetGlobalXid(),
+		BranchId:   int64(xaID.GetBranchId()),
+	})
+
+	require.Error(t, err)
+	assert.EqualValues(t, branch.BranchStatusPhasetwoRollbackFailedUnretryable, status)
+	assert.Contains(t, err.Error(), "already committed")
+}
+
 func TestXAResourceManager_CloseTimeoutXAConnections_SkipsHeldOraclePreparedConnection(t *testing.T) {
 	xaID := XaIdBuild("timeout-xid", 31)
 	targetConn := &closeTrackingConn{}
@@ -492,6 +606,16 @@ func TestXAResourceManager_CloseTimeoutXAConnections_SkipsHeldOraclePreparedConn
 	require.True(t, ok)
 	assert.Same(t, heldConn, held)
 	assert.Equal(t, 0, targetConn.closeCalls)
+}
+
+func withBranchStatusCache(t *testing.T) {
+	t.Helper()
+
+	prevBranchStatusCache := branchStatusCache
+	branchStatusCache = gcache.New(1024).LRU().Expiration(time.Minute * 10).Build()
+	t.Cleanup(func() {
+		branchStatusCache = prevBranchStatusCache
+	})
 }
 
 func TestXAResourceManager_CloseTimeoutXAConnections_IgnoresUnpreparedHeldConnection(t *testing.T) {

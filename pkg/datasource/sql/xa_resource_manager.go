@@ -174,6 +174,10 @@ func (xaManager *XAResourceManager) BranchCommit(ctx context.Context, branchReso
 	if status == branch.BranchStatusPhasetwoCommitted {
 		return status, nil
 	}
+	if status == branch.BranchStatusPhasetwoRollbacked {
+		return branch.BranchStatusPhasetwoCommitFailedUnretryable,
+			fmt.Errorf("xa branch already rollbacked, xid: %s", xaID.String())
+	}
 
 	connectionProxyXA, err := xaManager.finishBranch(ctx, xaID, branchResource)
 	if err != nil {
@@ -188,6 +192,7 @@ func (xaManager *XAResourceManager) BranchCommit(ctx context.Context, branchReso
 			return branch.BranchStatusPhasetwoCommitted, nil
 		}
 		if connectionProxyXA.isBranchRollbacked(err) {
+			setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoRollbacked)
 			return branch.BranchStatusPhasetwoCommitFailedUnretryable, err
 		}
 		return branch.BranchStatusPhasetwoCommitFailedRetryable, err
@@ -200,6 +205,18 @@ func (xaManager *XAResourceManager) BranchCommit(ctx context.Context, branchReso
 
 func (xaManager *XAResourceManager) BranchRollback(ctx context.Context, branchResource rm.BranchResource) (branch.BranchStatus, error) {
 	xaID := xaManager.xaIDBuilder(branchResource.Xid, uint64(branchResource.BranchId))
+	status, err := branchStatus(xaID.String())
+	if err != nil {
+		return branch.BranchStatusPhasetwoRollbackFailedRetryable, err
+	}
+	if status == branch.BranchStatusPhasetwoRollbacked {
+		return status, nil
+	}
+	if status == branch.BranchStatusPhasetwoCommitted {
+		return branch.BranchStatusPhasetwoRollbackFailedUnretryable,
+			fmt.Errorf("xa branch already committed, xid: %s", xaID.String())
+	}
+
 	connectionProxyXA, err := xaManager.finishBranch(ctx, xaID, branchResource)
 	if err != nil {
 		return branch.BranchStatusPhasetwoRollbackFailedUnretryable, err
@@ -209,14 +226,17 @@ func (xaManager *XAResourceManager) BranchRollback(ctx context.Context, branchRe
 	if err = connectionProxyXA.XaRollbackByBranchId(ctx, xaID); err != nil {
 		log.Errorf("rollback xa, resourceId: %s, err %v", branchResource.ResourceId, err)
 		if connectionProxyXA.isBranchRollbacked(err) {
+			setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoRollbacked)
 			return branch.BranchStatusPhasetwoRollbacked, nil
 		}
 		if connectionProxyXA.isBranchCommitted(err) {
+			setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoCommitted)
 			return branch.BranchStatusPhasetwoRollbackFailedUnretryable, err
 		}
 		return branch.BranchStatusPhasetwoRollbackFailedRetryable, err
 	}
 
+	setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoRollbacked)
 	log.Infof("%s was rollback", xaID.String())
 	return branch.BranchStatusPhasetwoRollbacked, nil
 }
