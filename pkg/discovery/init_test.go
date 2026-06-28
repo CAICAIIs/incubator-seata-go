@@ -150,6 +150,32 @@ func TestInitRegistryWithErrorReturnsProviderError(t *testing.T) {
 	}
 }
 
+func TestInitRegistryWithErrorKeepsExistingRegistryOnError(t *testing.T) {
+	registryServiceInstance = nil
+	t.Cleanup(func() {
+		registryServiceInstance = nil
+	})
+
+	if err := InitRegistryWithError(&ServiceConfig{}, &RegistryConfig{Type: FILE}); err != nil {
+		t.Fatalf("InitRegistryWithError() error = %v", err)
+	}
+	existing := GetRegistry()
+	if existing == nil {
+		t.Fatal("registry is nil")
+	}
+
+	err := InitRegistryWithError(nil, &RegistryConfig{Type: FILE})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err.Error() != "service config is nil" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if GetRegistry() != existing {
+		t.Fatal("existing registry should be kept on error")
+	}
+}
+
 func TestInitRegistryWithErrorNilProviderResult(t *testing.T) {
 	const providerType = "empty"
 	oldProvider, hadOldProvider := registryProviders[providerType]
