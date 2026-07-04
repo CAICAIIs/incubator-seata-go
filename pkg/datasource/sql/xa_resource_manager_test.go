@@ -38,6 +38,7 @@ import (
 	"seata.apache.org/seata-go/v2/pkg/protocol/message"
 	"seata.apache.org/seata-go/v2/pkg/remoting/getty"
 	"seata.apache.org/seata-go/v2/pkg/rm"
+	gettyrm "seata.apache.org/seata-go/v2/pkg/rm/remoting/getty"
 )
 
 type fakeXAResource struct {
@@ -174,7 +175,7 @@ func TestXAResourceManager_LockQuery(t *testing.T) {
 				})
 			defer patches.Reset()
 
-			xaManager := &XAResourceManager{rmRemoting: rm.GetRMRemotingInstance()}
+			xaManager := &XAResourceManager{rmRemoting: &gettyrm.GettyRMRemoting{}}
 
 			got, err := xaManager.LockQuery(context.Background(), param)
 
