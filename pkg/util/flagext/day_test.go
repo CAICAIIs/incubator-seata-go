@@ -18,8 +18,9 @@
 package flagext
 
 import (
+	"os"
+	"os/exec"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -69,18 +70,19 @@ func TestDayValueYAML(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, testStruct, actualStruct)
 	}
-	// Test UTC-stable string and YAML serialization in western timezones.
-	{
-		loc, err := time.LoadLocation("America/Los_Angeles")
-		if err != nil {
-			loc = time.FixedZone("UTC-8", -8*60*60)
-		}
+}
 
-		originalLocal := time.Local
-		time.Local = loc
-		defer func() {
-			time.Local = originalLocal
-		}()
+func TestDayValueYAMLWesternTimezone(t *testing.T) {
+	if os.Getenv("SEATA_GO_DAY_VALUE_TZ_HELPER") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestDayValueYAMLWesternTimezone$")
+		cmd.Env = append(os.Environ(), "SEATA_GO_DAY_VALUE_TZ_HELPER=1", "TZ=America/Los_Angeles")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(out))
+		return
+	}
+
+	// Test UTC-stable string and YAML serialization in a western timezone.
+	{
 		type TestStruct struct {
 			Day *DayValue `yaml:"day"`
 		}
