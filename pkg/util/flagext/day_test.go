@@ -47,6 +47,7 @@ func TestDayValueYAML(t *testing.T) {
 		err = yaml.Unmarshal(expected, &actualStruct)
 		require.NoError(t, err)
 		assert.Equal(t, testStruct, actualStruct)
+		assert.Equal(t, "1985-06-02T00:00:00Z", testStruct.Day.String())
 	}
 
 	// Test pointers of DayValue.
@@ -69,6 +70,7 @@ func TestDayValueYAML(t *testing.T) {
 		err = yaml.Unmarshal(expected, &actualStruct)
 		require.NoError(t, err)
 		assert.Equal(t, testStruct, actualStruct)
+		assert.Equal(t, "1985-06-02T00:00:00Z", testStruct.Day.String())
 	}
 }
 
@@ -100,5 +102,6 @@ func TestDayValueYAMLWesternTimezone(t *testing.T) {
 		err = yaml.Unmarshal(expected, &actualStruct)
 		require.NoError(t, err)
 		assert.Equal(t, testStruct, actualStruct)
+		assert.Equal(t, "1985-06-02T00:00:00Z", testStruct.Day.String())
 	}
 }
