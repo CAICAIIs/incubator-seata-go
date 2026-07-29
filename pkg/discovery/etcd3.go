@@ -39,7 +39,7 @@ const (
 type EtcdRegistryService struct {
 	client        *etcd3.Client
 	cfg           etcd3.Config
-	vgroupMapping map[string]string
+	vgroupMapping map[string]string // copied during construction; read-only afterwards
 	store         *AddressStore
 
 	stopCh    chan struct{}
@@ -68,7 +68,10 @@ func newEtcdRegistryService(config *ServiceConfig, etcd3Config *Etcd3Config) (Re
 		return nil, fmt.Errorf("failed to create etcd3 client: %w", err)
 	}
 
-	vgroupMapping := config.VgroupMapping
+	vgroupMapping := make(map[string]string, len(config.VgroupMapping))
+	for key, cluster := range config.VgroupMapping {
+		vgroupMapping[key] = cluster
+	}
 
 	etcdRegistryService := &EtcdRegistryService{
 		client:        cli,
@@ -207,7 +210,7 @@ func getClusterAndAddress(key []byte) (string, string, int, error) {
 func (s *EtcdRegistryService) Lookup(key string) ([]*ServiceInstance, error) {
 	cluster := s.vgroupMapping[key]
 	if cluster == "" {
-		return nil, fmt.Errorf("cluster doesnt exit")
+		return nil, fmt.Errorf("cluster doesn't exist")
 	}
 
 	return s.store.Snapshot(cluster), nil
@@ -220,10 +223,12 @@ func (s *EtcdRegistryService) Subscribe(key string, listener RegistryChangeListe
 
 	cluster := s.vgroupMapping[key]
 	if cluster == "" {
-		return nil, fmt.Errorf("cluster doesnt exit")
+		return nil, fmt.Errorf("cluster doesn't exist")
 	}
 
 	subscription := newRegistryChangeSubscription(listener)
+	// Register before checking closed so taking the initial snapshot cannot miss
+	// an update. If Close wins the race, the check below removes the callback.
 	initial, unsubscribe := s.store.subscribeWithSnapshot(cluster, func(changedCluster string, instances []*ServiceInstance) {
 		if changedCluster == cluster {
 			subscription.publish(RegistryChangeEvent{Key: key, Instances: instances})

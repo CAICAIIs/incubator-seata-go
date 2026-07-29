@@ -68,7 +68,7 @@ func TestEtcd3RegistryService_SubscribeValidatesInputs(t *testing.T) {
 
 	subscription, err = service.Subscribe("missing_tx_group", func(RegistryChangeEvent) {})
 	assert.Nil(t, subscription)
-	assert.EqualError(t, err, "cluster doesnt exit")
+	assert.EqualError(t, err, "cluster doesn't exist")
 }
 
 func TestEtcd3RegistryService_SubscribeCoalescesSlowListener(t *testing.T) {
