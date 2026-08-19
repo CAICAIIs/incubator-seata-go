@@ -112,12 +112,14 @@ type NamingServerClient struct {
 	vgroupAddressMap   sync.Map
 	listenerServiceMap sync.Map
 	subscribedVGroups  sync.Map
+	nextListenerID     uint64
 
 	tokenMu  sync.RWMutex
 	jwtToken string
 
 	healthCheckTicker *time.Ticker
 	closeChan         chan struct{}
+	closeOnce         sync.Once
 	wg                sync.WaitGroup
 
 	httpClient     *http.Client
@@ -128,11 +130,21 @@ type NamingListener interface {
 	OnEvent(vGroup string) error
 }
 
+type namingListenerEntry struct {
+	id       uint64
+	listener NamingListener
+}
+
 type NamingServerRegistryService struct {
-	client *NamingServerClient
+	client          *NamingServerClient
+	closeOnce       sync.Once
+	subscriptionsMu sync.Mutex
+	subscriptions   map[*registryChangeSubscription]struct{}
+	closed          bool
 }
 
 var _ NamingServerRegistry = (*NamingServerRegistryService)(nil)
+var _ RegistrySubscriber = (*NamingServerRegistryService)(nil)
 
 func buildNamingServerURL(addr string, elem ...string) (string, error) {
 	baseURL := strings.TrimSpace(addr)
@@ -149,8 +161,72 @@ func (n *NamingServerRegistryService) Lookup(key string) ([]*ServiceInstance, er
 	return n.client.Lookup(key)
 }
 
+func (n *NamingServerRegistryService) Subscribe(key string, listener RegistryChangeListener) (RegistrySubscription, error) {
+	if listener == nil {
+		return nil, fmt.Errorf("registry change listener is nil")
+	}
+	if n == nil || n.client == nil {
+		return nil, fmt.Errorf("naming server client is nil")
+	}
+
+	subscription := newRegistryChangeSubscription(listener)
+	unsubscribe, err := n.client.subscribe(key, &namingRegistryChangeListener{
+		key:          key,
+		client:       n.client,
+		subscription: subscription,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	instances, err := n.Lookup(key)
+	if err != nil {
+		unsubscribe()
+		return nil, err
+	}
+	subscription.initialize(RegistryChangeEvent{Key: key, Instances: instances}, func() {
+		unsubscribe()
+		n.removeSubscription(subscription)
+	})
+
+	n.subscriptionsMu.Lock()
+	if n.closed {
+		n.subscriptionsMu.Unlock()
+		subscription.Unsubscribe()
+		return nil, fmt.Errorf("registry service is closed")
+	}
+	if n.subscriptions == nil {
+		n.subscriptions = make(map[*registryChangeSubscription]struct{})
+	}
+	n.subscriptions[subscription] = struct{}{}
+	n.subscriptionsMu.Unlock()
+
+	subscription.start()
+	return subscription, nil
+}
+
 func (n *NamingServerRegistryService) Close() {
-	n.client.Close()
+	n.closeOnce.Do(func() {
+		n.subscriptionsMu.Lock()
+		n.closed = true
+		subscriptions := make([]*registryChangeSubscription, 0, len(n.subscriptions))
+		for subscription := range n.subscriptions {
+			subscriptions = append(subscriptions, subscription)
+		}
+		n.subscriptions = nil
+		n.subscriptionsMu.Unlock()
+
+		for _, subscription := range subscriptions {
+			subscription.Unsubscribe()
+		}
+		n.client.Close()
+	})
+}
+
+func (n *NamingServerRegistryService) removeSubscription(subscription *registryChangeSubscription) {
+	n.subscriptionsMu.Lock()
+	delete(n.subscriptions, subscription)
+	n.subscriptionsMu.Unlock()
 }
 
 func newNamingServerRegistryService(_ *ServiceConfig, cfg *NamingServerConfig) RegistryService {
@@ -565,13 +641,20 @@ func (c *NamingServerClient) handleMetadata(metaResp *MetaResponse, vGroup strin
 }
 
 func (c *NamingServerClient) Subscribe(vGroup string, listener NamingListener) error {
+	_, err := c.subscribe(vGroup, listener)
+	return err
+}
+
+func (c *NamingServerClient) subscribe(vGroup string, listener NamingListener) (func(), error) {
+	var listenerID uint64
 	c.mu.Lock()
 	if listener != nil {
-		var listeners []NamingListener
+		listenerID = atomic.AddUint64(&c.nextListenerID, 1)
+		var listeners []namingListenerEntry
 		if val, ok := c.listenerServiceMap.Load(vGroup); ok {
-			listeners = append(listeners, val.([]NamingListener)...)
+			listeners = append(listeners, val.([]namingListenerEntry)...)
 		}
-		listeners = append(listeners, listener)
+		listeners = append(listeners, namingListenerEntry{id: listenerID, listener: listener})
 		c.listenerServiceMap.Store(vGroup, listeners)
 	}
 	c.mu.Unlock()
@@ -580,7 +663,34 @@ func (c *NamingServerClient) Subscribe(vGroup string, listener NamingListener) e
 		c.wg.Add(1)
 		go c.watchLoop(vGroup)
 	}
-	return nil
+
+	return func() {
+		if listenerID != 0 {
+			c.unsubscribe(vGroup, listenerID)
+		}
+	}, nil
+}
+
+func (c *NamingServerClient) unsubscribe(vGroup string, listenerID uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	val, ok := c.listenerServiceMap.Load(vGroup)
+	if !ok {
+		return
+	}
+	listeners := val.([]namingListenerEntry)
+	next := make([]namingListenerEntry, 0, len(listeners))
+	for _, entry := range listeners {
+		if entry.id != listenerID {
+			next = append(next, entry)
+		}
+	}
+	if len(next) == 0 {
+		c.listenerServiceMap.Delete(vGroup)
+		return
+	}
+	c.listenerServiceMap.Store(vGroup, next)
 }
 
 func (c *NamingServerClient) watchLoop(vGroup string) {
@@ -622,8 +732,8 @@ func (c *NamingServerClient) watchLoop(vGroup string) {
 			if !ok {
 				continue
 			}
-			for _, listener := range val.([]NamingListener) {
-				if err := listener.OnEvent(vGroup); err != nil {
+			for _, entry := range val.([]namingListenerEntry) {
+				if err := entry.listener.OnEvent(vGroup); err != nil {
 					c.logger.Warn("listener callback failed", zap.Error(err))
 				}
 			}
@@ -692,10 +802,18 @@ func (c *NamingServerClient) Watch(vGroup string) (bool, error) {
 }
 
 func (c *NamingServerClient) Close() {
-	close(c.closeChan)
-	c.healthCheckTicker.Stop()
-	c.wg.Wait()
-	c.logger.Info("naming server client closed")
+	c.closeOnce.Do(func() {
+		if c.closeChan != nil {
+			close(c.closeChan)
+		}
+		if c.healthCheckTicker != nil {
+			c.healthCheckTicker.Stop()
+		}
+		c.wg.Wait()
+		if c.logger != nil {
+			c.logger.Info("naming server client closed")
+		}
+	})
 }
 
 func (n *NamingServerRegistryService) Register(instance *ServiceInstance) error {
@@ -720,4 +838,19 @@ func (n *NamingServerRegistryService) RefreshGroup(vGroup string) error {
 
 func (n *NamingServerRegistryService) Watch(vGroup string) (bool, error) {
 	return n.client.Watch(vGroup)
+}
+
+type namingRegistryChangeListener struct {
+	key          string
+	client       *NamingServerClient
+	subscription *registryChangeSubscription
+}
+
+func (l *namingRegistryChangeListener) OnEvent(vGroup string) error {
+	instances, err := l.client.Lookup(vGroup)
+	if err != nil {
+		return err
+	}
+	l.subscription.publish(RegistryChangeEvent{Key: l.key, Instances: instances})
+	return nil
 }
