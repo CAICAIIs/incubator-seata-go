@@ -304,7 +304,7 @@ func (g *ChannelManager) selectChannel(msg interface{}) *Channel {
 func (g *ChannelManager) selectAvailableChannel(channels *sync.Map, msg interface{}) *Channel {
 	selected := loadbalance.Select(loadbalance.GetLoadBalanceConfig().Type, channels, g.getXid(msg))
 	channel, ok := selected.(*Channel)
-	if ok && channel != nil && !channel.IsClosed() && g.isServerAddressAvailable(channel.addr) {
+	if ok && g.isChannelSelectable(channels, channel) {
 		return channel
 	}
 
@@ -312,10 +312,18 @@ func (g *ChannelManager) selectAvailableChannel(channels *sync.Map, msg interfac
 	// snapshot if a cached result points to a removed server address.
 	selected = loadbalance.Select("RandomLoadBalance", channels, g.getXid(msg))
 	channel, ok = selected.(*Channel)
-	if ok && channel != nil && !channel.IsClosed() && g.isServerAddressAvailable(channel.addr) {
+	if ok && g.isChannelSelectable(channels, channel) {
 		return channel
 	}
 	return nil
+}
+
+func (g *ChannelManager) isChannelSelectable(channels *sync.Map, channel *Channel) bool {
+	if channel == nil || channel.IsClosed() || !g.isServerAddressAvailable(channel.addr) {
+		return false
+	}
+	_, ok := channels.Load(channel)
+	return ok
 }
 
 func (g *ChannelManager) getXid(msg interface{}) string {
