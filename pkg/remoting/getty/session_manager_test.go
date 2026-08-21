@@ -18,6 +18,8 @@
 package getty
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,8 +41,11 @@ func TestSessionManagerRefreshesServerListFromRegistrySubscription(t *testing.T)
 		},
 	}
 	started := make(chan string, 2)
-	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) {
-		started <- serverAddress(instance)
+	closed := make(chan string, 1)
+	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) closeableClient {
+		address := serverAddress(instance)
+		started <- address
+		return &fakeServerClient{address: address, closed: closed}
 	})
 
 	manager.initWithRegistry(registry)
@@ -48,6 +53,7 @@ func TestSessionManagerRefreshesServerListFromRegistrySubscription(t *testing.T)
 	assert.Equal(t, "127.0.0.1:8091", nextStartedServer(t, started))
 
 	registry.publish([]*discovery.ServiceInstance{{Addr: "127.0.0.2", Port: 8092}})
+	assert.Equal(t, "127.0.0.1:8091", nextClosedServer(t, closed))
 	assert.Equal(t, "127.0.0.2:8092", nextStartedServer(t, started))
 	assert.False(t, manager.isServerAddressAvailable("127.0.0.1:8091"))
 	assert.True(t, manager.isServerAddressAvailable("127.0.0.2:8092"))
@@ -58,8 +64,10 @@ func TestSessionManagerFallsBackToLookupWhenRegistryDoesNotSubscribe(t *testing.
 		instances: []*discovery.ServiceInstance{{Addr: "127.0.0.1", Port: 8091}},
 	}
 	started := make(chan string, 1)
-	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) {
-		started <- serverAddress(instance)
+	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) closeableClient {
+		address := serverAddress(instance)
+		started <- address
+		return &fakeServerClient{address: address}
 	})
 
 	manager.initWithRegistry(registry)
@@ -85,6 +93,7 @@ func TestSessionManagerSelectSessionSkipsRemovedServerAddress(t *testing.T) {
 	removed := mock.NewMockTestSession(ctrl)
 	removed.EXPECT().IsClosed().Return(false).AnyTimes()
 	removed.EXPECT().RemoteAddr().Return("127.0.0.1:8091").AnyTimes()
+	removed.EXPECT().Close().Times(1)
 	kept := mock.NewMockTestSession(ctrl)
 	kept.EXPECT().IsClosed().Return(false).AnyTimes()
 	kept.EXPECT().RemoteAddr().Return("127.0.0.2:8092").AnyTimes()
@@ -95,9 +104,50 @@ func TestSessionManagerSelectSessionSkipsRemovedServerAddress(t *testing.T) {
 
 	selected := manager.selectSession(message.GlobalBeginRequest{TransactionName: "tx"})
 	assert.Equal(t, getty.Session(kept), selected)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&manager.sessionSize))
+	if _, ok := manager.serverClients.Load("127.0.0.1:8091"); ok {
+		t.Fatal("removed server client is still tracked")
+	}
 }
 
-func newTestSessionManager(startClient func(*discovery.ServiceInstance)) *SessionManager {
+func TestSessionManagerClosesStaleClientWhenAddressRemovedDuringStart(t *testing.T) {
+	started := make(chan string, 1)
+	resumeStart := make(chan struct{})
+	closed := make(chan string, 1)
+	manager := newTestSessionManager(func(instance *discovery.ServiceInstance) closeableClient {
+		address := serverAddress(instance)
+		started <- address
+		<-resumeStart
+		return &fakeServerClient{address: address, closed: closed}
+	})
+
+	refreshDone := make(chan struct{})
+	go func() {
+		manager.refreshServerList([]*discovery.ServiceInstance{{Addr: "127.0.0.1", Port: 8091}})
+		close(refreshDone)
+	}()
+	assert.Equal(t, "127.0.0.1:8091", nextStartedServer(t, started))
+
+	manager.refreshServerList(nil)
+	close(resumeStart)
+
+	select {
+	case <-refreshDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stale server client start to finish")
+	}
+	assert.Equal(t, "127.0.0.1:8091", nextClosedServer(t, closed))
+	if _, ok := manager.serverClients.Load("127.0.0.1:8091"); ok {
+		t.Fatal("stale server client is still tracked")
+	}
+}
+
+func newTestSessionManager(startClient func(*discovery.ServiceInstance) closeableClient) *SessionManager {
+	if startClient == nil {
+		startClient = func(*discovery.ServiceInstance) closeableClient {
+			return &fakeServerClient{}
+		}
+	}
 	return &SessionManager{
 		gettyConf:   &config.Config{},
 		seataConfig: &config.SeataConfig{TxServiceGroup: "default_tx_group"},
@@ -113,6 +163,18 @@ func nextStartedServer(t *testing.T, started <-chan string) string {
 		return address
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for server client start")
+	}
+	return ""
+}
+
+func nextClosedServer(t *testing.T, closed <-chan string) string {
+	t.Helper()
+
+	select {
+	case address := <-closed:
+		return address
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server client close")
 	}
 	return ""
 }
@@ -157,4 +219,18 @@ func cloneTestServiceInstances(instances []*discovery.ServiceInstance) []*discov
 		clones = append(clones, &clone)
 	}
 	return clones
+}
+
+type fakeServerClient struct {
+	address string
+	closed  chan<- string
+	once    sync.Once
+}
+
+func (c *fakeServerClient) Close() {
+	c.once.Do(func() {
+		if c.closed != nil {
+			c.closed <- c.address
+		}
+	})
 }

@@ -135,6 +135,12 @@ type namingListenerEntry struct {
 	listener NamingListener
 }
 
+type namingWatchState struct {
+	stopCh    chan struct{}
+	listeners int
+	permanent bool
+}
+
 type NamingServerRegistryService struct {
 	client          *NamingServerClient
 	closeOnce       sync.Once
@@ -161,6 +167,7 @@ func (n *NamingServerRegistryService) Lookup(key string) ([]*ServiceInstance, er
 	return n.client.Lookup(key)
 }
 
+// Subscribe reports NamingServer registry snapshots for a transaction service group.
 func (n *NamingServerRegistryService) Subscribe(key string, listener RegistryChangeListener) (RegistrySubscription, error) {
 	if listener == nil {
 		return nil, fmt.Errorf("registry change listener is nil")
@@ -168,18 +175,21 @@ func (n *NamingServerRegistryService) Subscribe(key string, listener RegistryCha
 	if n == nil || n.client == nil {
 		return nil, fmt.Errorf("naming server client is nil")
 	}
+	if n.isClosed() {
+		return nil, fmt.Errorf("registry service is closed")
+	}
 
 	subscription := newRegistryChangeSubscription(listener)
 	unsubscribe, err := n.client.subscribe(key, &namingRegistryChangeListener{
 		key:          key,
 		client:       n.client,
 		subscription: subscription,
-	})
+	}, false)
 	if err != nil {
 		return nil, err
 	}
 
-	instances, err := n.Lookup(key)
+	instances, err := n.client.lookupInstances(key)
 	if err != nil {
 		unsubscribe()
 		return nil, err
@@ -227,6 +237,12 @@ func (n *NamingServerRegistryService) removeSubscription(subscription *registryC
 	n.subscriptionsMu.Lock()
 	delete(n.subscriptions, subscription)
 	n.subscriptionsMu.Unlock()
+}
+
+func (n *NamingServerRegistryService) isClosed() bool {
+	n.subscriptionsMu.Lock()
+	defer n.subscriptionsMu.Unlock()
+	return n.closed
 }
 
 func newNamingServerRegistryService(_ *ServiceConfig, cfg *NamingServerConfig) RegistryService {
@@ -362,6 +378,10 @@ func (c *NamingServerClient) Lookup(vGroup string) ([]*ServiceInstance, error) {
 		return nil, fmt.Errorf("subscribe failed: %w", err)
 	}
 
+	return c.lookupInstances(vGroup)
+}
+
+func (c *NamingServerClient) lookupInstances(vGroup string) ([]*ServiceInstance, error) {
 	val, ok := c.vgroupAddressMap.Load(vGroup)
 	if !ok {
 		if err := c.RefreshGroup(vGroup); err != nil {
@@ -641,12 +661,15 @@ func (c *NamingServerClient) handleMetadata(metaResp *MetaResponse, vGroup strin
 }
 
 func (c *NamingServerClient) Subscribe(vGroup string, listener NamingListener) error {
-	_, err := c.subscribe(vGroup, listener)
+	_, err := c.subscribe(vGroup, listener, true)
 	return err
 }
 
-func (c *NamingServerClient) subscribe(vGroup string, listener NamingListener) (func(), error) {
+func (c *NamingServerClient) subscribe(vGroup string, listener NamingListener, permanent bool) (func(), error) {
 	var listenerID uint64
+	var state *namingWatchState
+	startWatch := false
+
 	c.mu.Lock()
 	if listener != nil {
 		listenerID = atomic.AddUint64(&c.nextListenerID, 1)
@@ -657,11 +680,24 @@ func (c *NamingServerClient) subscribe(vGroup string, listener NamingListener) (
 		listeners = append(listeners, namingListenerEntry{id: listenerID, listener: listener})
 		c.listenerServiceMap.Store(vGroup, listeners)
 	}
+	if val, ok := c.subscribedVGroups.Load(vGroup); ok {
+		state = val.(*namingWatchState)
+	} else {
+		state = &namingWatchState{stopCh: make(chan struct{})}
+		c.subscribedVGroups.Store(vGroup, state)
+		startWatch = true
+	}
+	if listenerID != 0 {
+		state.listeners++
+	}
+	if permanent {
+		state.permanent = true
+	}
 	c.mu.Unlock()
 
-	if _, loaded := c.subscribedVGroups.LoadOrStore(vGroup, struct{}{}); !loaded {
+	if startWatch {
 		c.wg.Add(1)
-		go c.watchLoop(vGroup)
+		go c.watchLoop(vGroup, state.stopCh)
 	}
 
 	return func() {
@@ -688,18 +724,33 @@ func (c *NamingServerClient) unsubscribe(vGroup string, listenerID uint64) {
 	}
 	if len(next) == 0 {
 		c.listenerServiceMap.Delete(vGroup)
+	} else {
+		c.listenerServiceMap.Store(vGroup, next)
+	}
+
+	val, ok = c.subscribedVGroups.Load(vGroup)
+	if !ok {
 		return
 	}
-	c.listenerServiceMap.Store(vGroup, next)
+	state := val.(*namingWatchState)
+	if state.listeners > 0 {
+		state.listeners--
+	}
+	if state.listeners == 0 && !state.permanent {
+		c.subscribedVGroups.Delete(vGroup)
+		close(state.stopCh)
+	}
 }
 
-func (c *NamingServerClient) watchLoop(vGroup string) {
+func (c *NamingServerClient) watchLoop(vGroup string, stopCh <-chan struct{}) {
 	defer c.wg.Done()
 	var retryCount int
 
 	for {
 		select {
 		case <-c.closeChan:
+			return
+		case <-stopCh:
 			return
 		default:
 		}
@@ -713,6 +764,8 @@ func (c *NamingServerClient) watchLoop(vGroup string) {
 				select {
 				case <-time.After(time.Duration(retryDelayMs) * time.Millisecond):
 				case <-c.closeChan:
+					return
+				case <-stopCh:
 					return
 				}
 			} else {
@@ -847,7 +900,7 @@ type namingRegistryChangeListener struct {
 }
 
 func (l *namingRegistryChangeListener) OnEvent(vGroup string) error {
-	instances, err := l.client.Lookup(vGroup)
+	instances, err := l.client.lookupInstances(vGroup)
 	if err != nil {
 		return err
 	}

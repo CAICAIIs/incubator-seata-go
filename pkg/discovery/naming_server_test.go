@@ -838,6 +838,9 @@ func TestNamingServerRegistryService_SubscribePublishesSnapshots(t *testing.T) {
 	if _, ok := client.listenerServiceMap.Load("default_tx_group"); ok {
 		t.Fatal("naming server listener was not removed after unsubscribe")
 	}
+	if _, ok := client.subscribedVGroups.Load("default_tx_group"); ok {
+		t.Fatal("naming server watch was not removed after unsubscribe")
+	}
 }
 
 func TestNamingServerRegistryService_CloseUnsubscribesListeners(t *testing.T) {
@@ -863,7 +866,31 @@ func TestNamingServerRegistryService_CloseUnsubscribesListeners(t *testing.T) {
 	if _, ok := client.listenerServiceMap.Load("default_tx_group"); ok {
 		t.Fatal("naming server listener was not removed after close")
 	}
+	if _, ok := client.subscribedVGroups.Load("default_tx_group"); ok {
+		t.Fatal("naming server watch was not removed after close")
+	}
 	service.Close()
+}
+
+func TestNamingServerRegistryService_SubscribeAfterCloseDoesNotStartWatch(t *testing.T) {
+	client := newSubscriptionTestNamingClient(t)
+	client.vgroupAddressMap.Store("default_tx_group", []NamingServerNode{{
+		Healthy:     true,
+		Transaction: Endpoint{Host: "127.0.0.1", Port: 8091},
+	}})
+	service := &NamingServerRegistryService{client: client}
+
+	service.Close()
+	subscription, err := service.Subscribe("default_tx_group", func(RegistryChangeEvent) {})
+	if err == nil {
+		t.Fatal("expected subscribe after close to fail")
+	}
+	if subscription != nil {
+		t.Fatal("expected subscribe after close to return nil subscription")
+	}
+	if _, ok := client.subscribedVGroups.Load("default_tx_group"); ok {
+		t.Fatal("subscribe after close started a naming server watch")
+	}
 }
 
 func TestNamingServerRegistryService_RegisterDeregisterNotSupported(t *testing.T) {

@@ -93,11 +93,20 @@ func TestRaftRegistryServiceCloseStopsSubscription(t *testing.T) {
 	service.publishClusterSnapshotLocked("test-cluster")
 	service.stateMu.Unlock()
 
-	select {
-	case event := <-events:
-		t.Fatalf("received event after registry close: %#v", event)
-	case <-time.After(50 * time.Millisecond):
-	}
+	assert.Equal(t, 0, len(events))
+}
+
+func TestRaftRegistryServiceSubscribeAfterCloseDoesNotLookup(t *testing.T) {
+	service := newSubscriptionTestRaftRegistry()
+	service.Close()
+
+	subscription, err := service.Subscribe("default_tx_group", func(RegistryChangeEvent) {})
+	assert.Nil(t, subscription)
+	assert.EqualError(t, err, "registry service is closed")
+
+	instances, err := service.Lookup("default_tx_group")
+	assert.Nil(t, instances)
+	assert.EqualError(t, err, "registry service is closed")
 }
 
 func newSubscriptionTestRaftRegistry() *RaftRegistryService {

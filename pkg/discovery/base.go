@@ -53,6 +53,7 @@ type RegistryChangeEvent struct {
 	Instances []*ServiceInstance
 }
 
+// RegistryChangeListener receives backend-neutral registry change snapshots.
 type RegistryChangeListener func(event RegistryChangeEvent)
 
 // RegistrySubscription cancels a registry change subscription. Unsubscribe is

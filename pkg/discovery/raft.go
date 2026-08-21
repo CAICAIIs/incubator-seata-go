@@ -99,6 +99,9 @@ func NewRaftRegistryService(config *ServiceConfig, raftConfig *RegistryConfig) *
 }
 
 func (r *RaftRegistryService) Lookup(key string) ([]*ServiceInstance, error) {
+	if r.isClosed() {
+		return nil, fmt.Errorf("registry service is closed")
+	}
 	clusterName := r.vgroupMapping[key]
 	if clusterName == "" {
 		return nil, fmt.Errorf("cluster doesn't exist for serviceGroup=%s", key)
@@ -164,6 +167,9 @@ func (r *RaftRegistryService) Subscribe(key string, listener RegistryChangeListe
 	if listener == nil {
 		return nil, fmt.Errorf("registry change listener is nil")
 	}
+	if r.isClosed() {
+		return nil, fmt.Errorf("registry service is closed")
+	}
 	clusterName := r.vgroupMapping[key]
 	if clusterName == "" {
 		return nil, fmt.Errorf("cluster doesn't exist for serviceGroup=%s", key)
@@ -205,6 +211,12 @@ func (r *RaftRegistryService) removeSubscription(subscription *registryChangeSub
 	r.subscriptionsMu.Lock()
 	delete(r.subscriptions, subscription)
 	r.subscriptionsMu.Unlock()
+}
+
+func (r *RaftRegistryService) isClosed() bool {
+	r.subscriptionsMu.Lock()
+	defer r.subscriptionsMu.Unlock()
+	return r.closed
 }
 
 func (r *RaftRegistryService) getServiceInstances(clusterName, group string) ([]*ServiceInstance, error) {

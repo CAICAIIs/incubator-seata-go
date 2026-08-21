@@ -61,7 +61,45 @@ type SessionManager struct {
 	serverAddressMu       sync.RWMutex
 	serverAddressSnapshot map[string]struct{}
 	serverAddressReady    bool
-	startClient           func(*discovery.ServiceInstance)
+	startClient           func(*discovery.ServiceInstance) closeableClient
+}
+
+type closeableClient interface {
+	Close()
+}
+
+type serverClientEntry struct {
+	mu     sync.Mutex
+	client closeableClient
+	closed bool
+}
+
+func (e *serverClientEntry) setClient(client closeableClient) bool {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		client.Close()
+		return false
+	}
+	e.client = client
+	e.mu.Unlock()
+	return true
+}
+
+func (e *serverClientEntry) Close() {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.closed = true
+	client := e.client
+	e.client = nil
+	e.mu.Unlock()
+
+	if client != nil {
+		client.Close()
+	}
 }
 
 func initSessionManager(gettyConfig *config.Config, seataConfig *config.SeataConfig) {
@@ -136,32 +174,69 @@ func (g *SessionManager) refreshServerList(instances []*discovery.ServiceInstanc
 		servers[serverAddress(clone)] = clone
 	}
 
-	g.serverAddressMu.Lock()
-	g.serverAddressSnapshot = make(map[string]struct{}, len(servers))
-	for address := range servers {
-		g.serverAddressSnapshot[address] = struct{}{}
+	removedAddresses := g.replaceServerAddressSnapshot(servers)
+	for _, address := range removedAddresses {
+		g.releaseServerAddress(address)
 	}
-	g.serverAddressReady = true
-	g.serverAddressMu.Unlock()
 
 	for _, instance := range servers {
 		g.ensureServerClient(instance)
 	}
 }
 
-func (g *SessionManager) ensureServerClient(instance *discovery.ServiceInstance) {
-	address := serverAddress(instance)
-	if _, loaded := g.serverClients.LoadOrStore(address, struct{}{}); loaded {
-		return
+func (g *SessionManager) replaceServerAddressSnapshot(servers map[string]*discovery.ServiceInstance) []string {
+	g.serverAddressMu.Lock()
+	var removedAddresses []string
+	for address := range g.serverAddressSnapshot {
+		if _, ok := servers[address]; !ok {
+			removedAddresses = append(removedAddresses, address)
+		}
 	}
-	if g.startClient != nil {
-		g.startClient(instance)
-		return
+	g.serverAddressSnapshot = make(map[string]struct{}, len(servers))
+	for address := range servers {
+		g.serverAddressSnapshot[address] = struct{}{}
 	}
-	g.startGettyClient(instance)
+	g.serverAddressReady = true
+	g.serverAddressMu.Unlock()
+	return removedAddresses
 }
 
-func (g *SessionManager) startGettyClient(instance *discovery.ServiceInstance) {
+func (g *SessionManager) ensureServerClient(instance *discovery.ServiceInstance) {
+	address := serverAddress(instance)
+	entry := &serverClientEntry{}
+	if _, loaded := g.serverClients.LoadOrStore(address, entry); loaded {
+		return
+	}
+	var client closeableClient
+	if g.startClient != nil {
+		client = g.startClient(instance)
+	} else {
+		client = g.startGettyClient(instance)
+	}
+	if client == nil {
+		g.serverClients.CompareAndDelete(address, entry)
+		return
+	}
+	if !entry.setClient(client) {
+		return
+	}
+	if !g.isServerAddressAvailable(address) || !g.isServerClientEntryCurrent(address, entry) {
+		g.releaseServerClientEntry(address, entry)
+		return
+	}
+}
+
+func (g *SessionManager) isServerClientEntryCurrent(address string, entry *serverClientEntry) bool {
+	current, ok := g.serverClients.Load(address)
+	return ok && current == entry
+}
+
+func (g *SessionManager) releaseServerClientEntry(address string, entry *serverClientEntry) {
+	g.serverClients.CompareAndDelete(address, entry)
+	entry.Close()
+}
+
+func (g *SessionManager) startGettyClient(instance *discovery.ServiceInstance) getty.Client {
 	gettyClient := getty.NewTCPClient(
 		getty.WithServerAddress(serverAddress(instance)),
 		// todo if read c.gettyConf.ConnectionNum, will cause the connect to fail
@@ -170,6 +245,24 @@ func (g *SessionManager) startGettyClient(instance *discovery.ServiceInstance) {
 		getty.WithClientTaskPool(gxsync.NewTaskPoolSimple(0)),
 	)
 	go gettyClient.RunEventLoop(g.newSession)
+	return gettyClient
+}
+
+func (g *SessionManager) releaseServerAddress(address string) {
+	if clientAny, loaded := g.serverClients.LoadAndDelete(address); loaded {
+		if client, ok := clientAny.(closeableClient); ok && client != nil {
+			client.Close()
+		}
+	}
+	if sessionsAny, ok := g.serverSessions.LoadAndDelete(address); ok {
+		sessions := sessionsAny.(*sync.Map)
+		sessions.Range(func(key, _ interface{}) bool {
+			if session, ok := key.(getty.Session); ok {
+				g.releaseSession(session)
+			}
+			return true
+		})
+	}
 }
 
 func serverAddress(instance *discovery.ServiceInstance) string {
@@ -238,18 +331,20 @@ func (g *SessionManager) newSession(session getty.Session) error {
 }
 
 func (g *SessionManager) selectSession(msg interface{}) getty.Session {
-	selected := loadbalance.Select(loadbalance.GetLoadBalanceConfig().Type, g.selectableSessions(), g.getXid(msg))
+	sessions := g.selectableSessions()
+	selected := loadbalance.Select(loadbalance.GetLoadBalanceConfig().Type, sessions, g.getXid(msg))
 	session, ok := selected.(getty.Session)
 	if ok && session != nil {
 		return session
 	}
 
-	if atomic.LoadInt32(&g.sessionSize) == 0 {
+	if selectableConnectionCount(sessions) == 0 {
 		ticker := time.NewTicker(time.Duration(checkAliveInternal) * time.Millisecond)
 		defer ticker.Stop()
 		for i := 0; i < maxCheckAliveRetry; i++ {
 			<-ticker.C
-			selected = loadbalance.Select(loadbalance.GetLoadBalanceConfig().Type, g.selectableSessions(), g.getXid(msg))
+			sessions = g.selectableSessions()
+			selected = loadbalance.Select(loadbalance.GetLoadBalanceConfig().Type, sessions, g.getXid(msg))
 			session, ok = selected.(getty.Session)
 			if ok && session != nil {
 				return session
@@ -267,7 +362,7 @@ func (g *SessionManager) selectableSessions() *sync.Map {
 			return true
 		}
 		if session.IsClosed() {
-			g.allSessions.Delete(session)
+			g.releaseSession(session)
 			return true
 		}
 		if g.isServerAddressAvailable(session.RemoteAddr()) {
@@ -311,11 +406,17 @@ func (g *SessionManager) getXid(msg interface{}) string {
 }
 
 func (g *SessionManager) releaseSession(session getty.Session) {
-	g.allSessions.Delete(session)
-	if !session.IsClosed() {
-		m, _ := g.serverSessions.LoadOrStore(session.RemoteAddr(), &sync.Map{})
+	if session == nil {
+		return
+	}
+	if _, loaded := g.allSessions.LoadAndDelete(session); !loaded {
+		return
+	}
+	if m, ok := g.serverSessions.Load(session.RemoteAddr()); ok {
 		sMap := m.(*sync.Map)
 		sMap.Delete(session)
+	}
+	if !session.IsClosed() {
 		session.Close()
 	}
 	atomic.AddInt32(&g.sessionSize, -1)
@@ -327,9 +428,20 @@ func (g *SessionManager) registerSession(session getty.Session) {
 		session.Close()
 		return
 	}
-	g.allSessions.Store(session, true)
+	if _, loaded := g.allSessions.LoadOrStore(session, true); loaded {
+		return
+	}
 	m, _ := g.serverSessions.LoadOrStore(session.RemoteAddr(), &sync.Map{})
 	sMap := m.(*sync.Map)
 	sMap.Store(session, true)
 	atomic.AddInt32(&g.sessionSize, 1)
+}
+
+func selectableConnectionCount(connections *sync.Map) int {
+	count := 0
+	connections.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
 }

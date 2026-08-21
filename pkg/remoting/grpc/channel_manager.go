@@ -70,6 +70,8 @@ type ChannelManager struct {
 	startChannel          func(*discovery.ServiceInstance)
 }
 
+type channelStartEntry struct{}
+
 func initChannelManager(grpcConfig *config.Config) {
 	if channelManager == nil {
 		onceChannelManager.Do(func() {
@@ -137,42 +139,57 @@ func (g *ChannelManager) refreshServerList(instances []*discovery.ServiceInstanc
 		servers[serverAddress(clone)] = clone
 	}
 
-	g.serverAddressMu.Lock()
-	g.serverAddressSnapshot = make(map[string]struct{}, len(servers))
-	for address := range servers {
-		g.serverAddressSnapshot[address] = struct{}{}
+	removedAddresses := g.replaceServerAddressSnapshot(servers)
+	for _, address := range removedAddresses {
+		g.releaseChannelByAddr(address)
 	}
-	g.serverAddressReady = true
-	g.serverAddressMu.Unlock()
 
 	for _, instance := range servers {
 		g.ensureChannel(instance)
 	}
 }
 
+func (g *ChannelManager) replaceServerAddressSnapshot(servers map[string]*discovery.ServiceInstance) []string {
+	g.serverAddressMu.Lock()
+	var removedAddresses []string
+	for address := range g.serverAddressSnapshot {
+		if _, ok := servers[address]; !ok {
+			removedAddresses = append(removedAddresses, address)
+		}
+	}
+	g.serverAddressSnapshot = make(map[string]struct{}, len(servers))
+	for address := range servers {
+		g.serverAddressSnapshot[address] = struct{}{}
+	}
+	g.serverAddressReady = true
+	g.serverAddressMu.Unlock()
+	return removedAddresses
+}
+
 func (g *ChannelManager) ensureChannel(instance *discovery.ServiceInstance) {
 	address := serverAddress(instance)
-	if _, loaded := g.startedAddresses.LoadOrStore(address, struct{}{}); loaded {
+	entry := &channelStartEntry{}
+	if _, loaded := g.startedAddresses.LoadOrStore(address, entry); loaded {
 		return
 	}
 	if g.startChannel != nil {
 		g.startChannel(instance)
 		return
 	}
-	go g.startGrpcChannel(instance)
+	go g.startGrpcChannel(instance, entry)
 }
 
-func (g *ChannelManager) startGrpcChannel(instance *discovery.ServiceInstance) {
+func (g *ChannelManager) startGrpcChannel(instance *discovery.ServiceInstance, entry *channelStartEntry) {
 	addr := serverAddress(instance)
-	if !g.isServerAddressAvailable(addr) {
-		g.startedAddresses.Delete(addr)
+	if !g.isServerAddressAvailable(addr) || !g.isChannelStartCurrent(addr, entry) {
+		g.deleteChannelStart(addr, entry)
 		return
 	}
 
 	conn, err := g.newConn(addr)
 	if err != nil {
 		log.Errorf("failed to dial gRPC addr %s: %v", addr, err)
-		g.startedAddresses.Delete(addr)
+		g.deleteChannelStart(addr, entry)
 		return
 	}
 
@@ -194,18 +211,32 @@ func (g *ChannelManager) startGrpcChannel(instance *discovery.ServiceInstance) {
 	if err != nil {
 		log.Errorf("failed to create gRPC stream error: %v", err)
 		_ = conn.Close()
-		g.startedAddresses.Delete(addr)
+		g.deleteChannelStart(addr, entry)
+		return
+	}
+	if !g.isServerAddressAvailable(addr) || !g.isChannelStartCurrent(addr, entry) {
+		channel.close()
+		g.deleteChannelStart(addr, entry)
 		return
 	}
 	if !g.registerChannel(channel) {
 		_ = conn.Close()
-		g.startedAddresses.Delete(addr)
+		g.deleteChannelStart(addr, entry)
 		return
 	}
 	if err = g.registerTm(addr); err != nil {
 		log.Errorf("%v", err)
 		g.releaseChannelByAddr(addr)
 	}
+}
+
+func (g *ChannelManager) isChannelStartCurrent(address string, entry *channelStartEntry) bool {
+	current, ok := g.startedAddresses.Load(address)
+	return ok && current == entry
+}
+
+func (g *ChannelManager) deleteChannelStart(address string, entry *channelStartEntry) {
+	g.startedAddresses.CompareAndDelete(address, entry)
 }
 
 func (g *ChannelManager) getAvailServerList(registryService discovery.RegistryService) []*discovery.ServiceInstance {
@@ -287,12 +318,13 @@ func (g *ChannelManager) selectChannel(msg interface{}) *Channel {
 		return channel
 	}
 
-	if atomic.LoadInt32(&g.clientSize) == 0 {
+	if selectableConnectionCount(channels) == 0 {
 		ticker := time.NewTicker(time.Duration(checkAliveInternal) * time.Millisecond)
 		defer ticker.Stop()
 		for i := 0; i < maxCheckAliveRetry; i++ {
 			<-ticker.C
-			channel = g.selectAvailableChannel(g.selectableChannels(), msg)
+			channels = g.selectableChannels()
+			channel = g.selectAvailableChannel(channels, msg)
 			if channel != nil {
 				return channel
 			}
@@ -364,10 +396,11 @@ func (g *ChannelManager) releaseChannel(channel *Channel) {
 	if _, loaded := g.allChannels.LoadAndDelete(channel); !loaded {
 		return
 	}
-	if !channel.IsClosed() {
-		m, _ := g.serverChannels.LoadOrStore(channel.addr, &sync.Map{})
+	if m, ok := g.serverChannels.Load(channel.addr); ok {
 		sMap := m.(*sync.Map)
 		sMap.Delete(channel)
+	}
+	if !channel.IsClosed() {
 		channel.close()
 	}
 	atomic.AddInt32(&g.clientSize, -1)
@@ -379,14 +412,22 @@ func (g *ChannelManager) releaseChannel(channel *Channel) {
 func (g *ChannelManager) registerChannel(channel *Channel) bool {
 	if !g.isServerAddressAvailable(channel.addr) {
 		log.Warnf("skip channel for removed server address: %s", channel.addr)
-		channel.close()
+		if _, loaded := g.allChannels.Load(channel); loaded {
+			g.releaseChannel(channel)
+		} else if !channel.IsClosed() {
+			channel.close()
+		}
 		return false
 	}
-	g.allChannels.LoadOrStore(channel, true)
+	if _, loaded := g.allChannels.LoadOrStore(channel, true); loaded {
+		return true
+	}
 	m, _ := g.serverChannels.LoadOrStore(channel.addr, &sync.Map{})
 	sMap := m.(*sync.Map)
 	sMap.Store(channel, true)
-	g.startedAddresses.Store(channel.addr, struct{}{})
+	if _, loaded := g.startedAddresses.Load(channel.addr); !loaded {
+		g.startedAddresses.Store(channel.addr, &channelStartEntry{})
+	}
 	atomic.AddInt32(&g.clientSize, 1)
 	return true
 }
@@ -399,7 +440,10 @@ func (g *ChannelManager) releaseChannelByAddr(addr string) {
 		}
 		return true
 	})
+	g.serverChannels.Delete(addr)
+	g.startedAddresses.Delete(addr)
 }
+
 func (g *ChannelManager) getAllChannelIsClosedByAddr(addr string) bool {
 	flag := true
 	g.allChannels.Range(func(key, value any) bool {
@@ -432,6 +476,15 @@ func (g *ChannelManager) selectableChannels() *sync.Map {
 		return true
 	})
 	return channels
+}
+
+func selectableConnectionCount(connections *sync.Map) int {
+	count := 0
+	connections.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 func (g *ChannelManager) isServerAddressAvailable(address string) bool {

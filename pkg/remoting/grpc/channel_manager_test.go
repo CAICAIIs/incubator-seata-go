@@ -18,6 +18,7 @@
 package grpc
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -35,8 +36,14 @@ func TestChannelManagerRefreshesServerListFromRegistrySubscription(t *testing.T)
 		},
 	}
 	started := make(chan string, 2)
+	startCount := make(map[string]int)
+	var startMu sync.Mutex
 	manager := newTestChannelManager(func(instance *discovery.ServiceInstance) {
-		started <- serverAddress(instance)
+		address := serverAddress(instance)
+		startMu.Lock()
+		startCount[address]++
+		startMu.Unlock()
+		started <- address
 	})
 
 	manager.initWithRegistry(registry)
@@ -48,12 +55,16 @@ func TestChannelManagerRefreshesServerListFromRegistrySubscription(t *testing.T)
 	assert.False(t, manager.isServerAddressAvailable("127.0.0.1:8091"))
 	assert.True(t, manager.isServerAddressAvailable("127.0.0.2:8092"))
 
+	registry.publish([]*discovery.ServiceInstance{{Addr: "127.0.0.2", Port: 8092}})
+	startMu.Lock()
+	assert.Equal(t, 1, startCount["127.0.0.2:8092"])
+	startMu.Unlock()
+
 	registry.publish([]*discovery.ServiceInstance{{Addr: "127.0.0.1", Port: 8091}})
-	select {
-	case address := <-started:
-		t.Fatalf("started a duplicate channel for retained address %s", address)
-	case <-time.After(50 * time.Millisecond):
-	}
+	assert.Equal(t, "127.0.0.1:8091", nextStartedChannel(t, started))
+	startMu.Lock()
+	assert.Equal(t, 2, startCount["127.0.0.1:8091"])
+	startMu.Unlock()
 }
 
 func TestChannelManagerFallsBackToLookupWhenRegistryDoesNotSubscribe(t *testing.T) {
@@ -90,10 +101,41 @@ func TestChannelManagerSelectChannelSkipsRemovedServerAddress(t *testing.T) {
 	assert.True(t, manager.registerChannel(kept))
 	manager.refreshServerList([]*discovery.ServiceInstance{{Addr: "127.0.0.2", Port: 8092}})
 
+	assert.True(t, removed.IsClosed())
 	assert.Equal(t, kept, manager.selectChannel(&struct{ TransactionName string }{TransactionName: "tx"}))
+	if _, ok := manager.startedAddresses.Load("127.0.0.1:8091"); ok {
+		t.Fatal("removed channel address is still tracked")
+	}
+}
+
+func TestChannelCloseDoesNotWaitWithMutexHeld(t *testing.T) {
+	channel := &Channel{closeCh: make(chan struct{})}
+	channel.wg.Add(1)
+
+	go func() {
+		defer channel.wg.Done()
+		<-channel.closeCh
+		channel.mu.Lock()
+		channel.mu.Unlock()
+	}()
+
+	closed := make(chan struct{})
+	go func() {
+		channel.close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for channel close")
+	}
 }
 
 func newTestChannelManager(startChannel func(*discovery.ServiceInstance)) *ChannelManager {
+	if startChannel == nil {
+		startChannel = func(*discovery.ServiceInstance) {}
+	}
 	return &ChannelManager{
 		config:       &config.Config{},
 		seataConfig:  &config.SeataConfig{TxServiceGroup: "default_tx_group"},
