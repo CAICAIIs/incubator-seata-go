@@ -48,6 +48,103 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
+func TestATConnRejectsPreparedMultiSQL(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	targetConn := mock.NewMockTestDriverConn(ctrl)
+
+	conn := &ATConn{Conn: &Conn{targetConn: targetConn, dbType: types.DBTypeMySQL}}
+
+	queries := []string{"INSERT INTO t_user(id) VALUES (?);" + "INSERT INTO t_user(id) VALUES (?)",
+		"UPDATE t_user SET name = ? WHERE id = ?;" + "DELETE FROM t_user_log WHERE user_id = ?",
+	}
+
+	for _, query := range queries {
+		stmt, err := conn.Prepare(query)
+		assert.Nil(t, stmt)
+		assert.ErrorIs(t, err, errATPreparedMultiSQLUnsupported)
+
+		stmt, err = conn.PrepareContext(context.Background(), query)
+		assert.Nil(t, stmt)
+		assert.ErrorIs(t, err, errATPreparedMultiSQLUnsupported)
+	}
+}
+
+func TestRejectATPreparedMultiSQLAllowsSingleStatement(t *testing.T) {
+	err := rejectATPreparedMultiSQL(types.DBTypeMySQL, "UPDATE t_user SET name = ? WHERE id = ?")
+
+	assert.NoError(t, err)
+}
+
+func TestRejectATPreparedMultiSQLSkipsParserWithoutSemicolon(t *testing.T) {
+	originalParseATPreparedSQL := parseATPreparedSQL
+	t.Cleanup(func() { parseATPreparedSQL = originalParseATPreparedSQL })
+
+	parseCalls := 0
+	parseATPreparedSQL = func(string) (*types.ParseContext, error) {
+		parseCalls++
+		return nil, errors.New("unexpected parser call")
+	}
+
+	err := rejectATPreparedMultiSQL(types.DBTypeMySQL, "UPDATE t_user SET name = ? WHERE id = ?")
+
+	assert.NoError(t, err)
+	assert.Zero(t, parseCalls)
+}
+
+func TestRejectATPreparedMultiSQLAllowsParserFailure(t *testing.T) {
+	originalParseATPreparedSQL := parseATPreparedSQL
+	t.Cleanup(func() { parseATPreparedSQL = originalParseATPreparedSQL })
+
+	parserError := errors.New("unsupported SQL syntax")
+	tests := []struct {
+		name     string
+		parseCtx *types.ParseContext
+		err      error
+	}{
+		{
+			name: "parser returns error",
+			err:  parserError,
+		},
+		{
+			name: "parser returns nil context",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parseCalls := 0
+			parseATPreparedSQL = func(string) (*types.ParseContext, error) {
+				parseCalls++
+				return tt.parseCtx, tt.err
+			}
+
+			err := rejectATPreparedMultiSQL(types.DBTypeMySQL, "UPDATE t_user SET name = ?; unsupported syntax")
+
+			assert.NoError(t, err)
+			assert.Equal(t, 1, parseCalls)
+		})
+	}
+}
+
+func TestATConnAllowsPreparedMultiSQLForPostgreSQL(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	targetConn := mock.NewMockTestDriverConn(ctrl)
+	targetStmt := mock.NewMockTestDriverStmt(ctrl)
+	query := "UPDATE t_user SET name = $1 WHERE id = $2;DELETE FROM t_user_log WHERE user_id = $3"
+	conn := &ATConn{Conn: &Conn{targetConn: targetConn, dbType: types.DBTypePostgreSQL}}
+
+	targetConn.EXPECT().Prepare(query).Return(targetStmt, nil)
+	targetConn.EXPECT().PrepareContext(gomock.Any(), query).Return(targetStmt, nil)
+
+	stmt, err := conn.Prepare(query)
+	assert.NotNil(t, stmt)
+	assert.NoError(t, err)
+
+	stmt, err = conn.PrepareContext(context.Background(), query)
+	assert.NotNil(t, stmt)
+	assert.NoError(t, err)
+}
+
 type postgresMockRows struct {
 	columns []string
 	data    [][]driver.Value
