@@ -111,11 +111,13 @@ func TestChannelManagerSelectChannelSkipsRemovedServerAddress(t *testing.T) {
 func TestChannelCloseDoesNotWaitWithMutexHeld(t *testing.T) {
 	channel := &Channel{closeCh: make(chan struct{})}
 	channel.wg.Add(1)
+	observedClosed := make(chan bool, 1)
 
 	go func() {
 		defer channel.wg.Done()
 		<-channel.closeCh
 		channel.mu.Lock()
+		observedClosed <- channel.IsClosed()
 		channel.mu.Unlock()
 	}()
 
@@ -130,6 +132,7 @@ func TestChannelCloseDoesNotWaitWithMutexHeld(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for channel close")
 	}
+	assert.True(t, <-observedClosed)
 }
 
 func newTestChannelManager(startChannel func(*discovery.ServiceInstance)) *ChannelManager {
