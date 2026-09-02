@@ -170,13 +170,8 @@ func (c *OracleXAConn) Rollback(ctx context.Context, xid string) error {
 	return c.exec(ctx, oracleXAWithXidBlock("XA_ROLLBACK", xaXID, "DBMS_XA.XA_ROLLBACK(l_xid)"))
 }
 
-// Recover is intentionally not supported in this first stage of Oracle XA
-// (#1116 PR1): listing in-doubt branches on Oracle goes through the
-// DBA_XA_TRANSACTIONS view / DBMS transaction procedures rather than a
-// DBMS_XA recover call we can map onto the XAResource interface. Known
-// limitation: after a TC/client crash, in-doubt Oracle branches are NOT
-// recovered automatically and require manual intervention. Tracked as a
-// follow-up for a later stage.
+// Not supported in this stage: in-doubt branches must be resolved manually via
+// DBA_XA_TRANSACTIONS (see #1116).
 func (c *OracleXAConn) Recover(ctx context.Context, flag int) ([]string, error) {
 	if flag&TMStartRScan == 0 {
 		return nil, nil
@@ -253,10 +248,8 @@ func oracleXABranchXid(xid string) (*oracleXID, error) {
 		return nil, fmt.Errorf("invalid xa branch xid: %s", xid)
 	}
 
-	// The leading '-' in the branch qualifier is intentional: it mirrors how
-	// XABranchXid encodes branch IDs framework-wide (branchIdPrefix + branchId,
-	// see xa_branch_xid.go encode), so Oracle gtrid/bqual split stays consistent
-	// with the MySQL XA construction and the TC-side branch identification.
+	// bqual keeps the leading '-' to match the framework-wide XABranchXid
+	// encoding (branchIdPrefix + branchId).
 	xaXID := &oracleXID{
 		formatID:            oracleXAFormatID,
 		globalTransactionID: []byte(xid[:branchSplitIdx]),
