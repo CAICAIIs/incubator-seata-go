@@ -233,7 +233,6 @@ func (db *DBResource) ConnectionForXA(ctx context.Context, xaXid XAXid) (*XAConn
 	if err != nil {
 		return nil, fmt.Errorf("create xa resoruce err:%w", err)
 	}
-	xaErrorClassifier := xa.CreateErrorClassifier(db.dbType)
 	xaConn := &XAConn{
 		Conn: &Conn{
 			targetConn: newDriverConn,
@@ -241,7 +240,7 @@ func (db *DBResource) ConnectionForXA(ctx context.Context, xaXid XAXid) (*XAConn
 		},
 		xaBranchXid:       XaIdBuild(xaXid.GetGlobalXid(), xaXid.GetBranchId()),
 		xaResource:        xaResource,
-		xaErrorClassifier: xaErrorClassifier,
+		xaErrorClassifier: xa.CreateErrorClassifier(db.dbType),
 	}
 	return xaConn, nil
 }

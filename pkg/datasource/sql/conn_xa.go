@@ -771,7 +771,7 @@ func (c *XAConn) isBranchRollbacked(err error) bool {
 }
 
 func (c *XAConn) isBranchFinished(err error) bool {
-	return err == nil || (c.xaErrorClassifier != nil && c.xaErrorClassifier.IsAlreadyEnded(err))
+	return c.xaErrorClassifier != nil && c.xaErrorClassifier.IsAlreadyEnded(err)
 }
 
 func (c *XAConn) finishTargetTx(commit bool) error {

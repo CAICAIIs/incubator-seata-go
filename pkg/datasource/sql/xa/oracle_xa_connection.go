@@ -199,7 +199,7 @@ func (c *OracleXAConn) SetTransactionTimeout(duration time.Duration) bool {
 func (c *OracleXAConn) exec(ctx context.Context, query string) error {
 	conn, ok := c.Conn.(driver.ExecerContext)
 	if !ok {
-		return driver.ErrSkip
+		return errors.New("oracle xa conn does not implement driver.ExecerContext")
 	}
 
 	_, err := conn.ExecContext(ctx, query, nil)
@@ -209,7 +209,7 @@ func (c *OracleXAConn) exec(ctx context.Context, query string) error {
 func (c *OracleXAConn) queryInt(ctx context.Context, query string) (int, error) {
 	conn, ok := c.Conn.(driver.QueryerContext)
 	if !ok {
-		return 0, driver.ErrSkip
+		return 0, errors.New("oracle xa conn does not implement driver.QueryerContext")
 	}
 
 	rows, err := conn.QueryContext(ctx, query, nil)
